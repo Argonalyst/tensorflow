@@ -14,27 +14,26 @@
 # ==============================================================================
 """Tests for JIT compilation on the CPU and GPU devices."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
+
 import numpy as np
 
 from tensorflow.compiler.tests import test_utils
-from tensorflow.contrib.compiler import jit
 from tensorflow.core.protobuf import config_pb2
 from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python.client import session as session_lib
+from tensorflow.python.compiler.xla import jit
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import function
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import cond
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import gradients_impl
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn_ops
+from tensorflow.python.ops import while_loop
 from tensorflow.python.platform import test
 
 
@@ -95,7 +94,12 @@ class JitLaunchTest(test.TestCase):
   # If 'require_kernel_launch' is True, then we verify that an XlaCompile/XlaRun
   # node actually ran. However, it is sometimes possible for XlaCompile/XlaRun
   # ops to be constant-folded away, so the check is optional.
-  def _compare(self, fn, args, require_kernel_launch=True, noinline=None):
+  def _compare(self,
+               fn,
+               args,
+               require_kernel_launch=True,
+               name=None,
+               noinline=None):
     with session_lib.Session(config=NoRewriteSessionConfig()) as sess:
       placeholders = []
       feeds = {}
@@ -105,7 +109,8 @@ class JitLaunchTest(test.TestCase):
         placeholders.append(placeholder)
         feeds[placeholder] = arg
 
-      compiled_op = CompiledKernel(fn, *placeholders, noinline=noinline)
+      compiled_op = CompiledKernel(
+          fn, *placeholders, name=name, noinline=noinline)
       direct_op = fn(*placeholders)
 
       run_metadata = config_pb2.RunMetadata()
@@ -116,7 +121,7 @@ class JitLaunchTest(test.TestCase):
       print("Compiled Result {}".format(compiled))
 
       if require_kernel_launch:
-        self.assert_(MetadataHasXlaRunOp(run_metadata))
+        self.assertTrue(MetadataHasXlaRunOp(run_metadata))
 
         direct = sess.run(direct_op, feeds)
         print("Direct Result {}".format(direct))
@@ -155,17 +160,16 @@ class JitLaunchTest(test.TestCase):
     # to symbolically execute Bar correctly regardless of whether Bar is inlined
     # or not.
 
-    # TODO(b/36139787): Re-enable this test when noinline works again.
     # Tests compiled=True and noinline=True.
-    # self._compare(
-    #     AddOnceReturnTwice, [np.array(
-    #         [[[0.5, -1.0]]], dtype=np.float32)],
-    #     noinline=True)
+    self._compare(
+        AddOnceReturnTwice, [np.array([[[0.5, -1.0]]], dtype=np.float32)],
+        name="AddOnceReturnTwice_inline",
+        noinline=True)
 
     # Tests compiled=True and noinline=False.
     self._compare(
-        AddOnceReturnTwice, [np.array(
-            [[[0.5, -1.0]]], dtype=np.float32)],
+        AddOnceReturnTwice, [np.array([[[0.5, -1.0]]], dtype=np.float32)],
+        name="AddOnceReturnTwice_noinline",
         noinline=False)
 
   def testOneConstOutput(self):
@@ -264,7 +268,7 @@ class JitLaunchTest(test.TestCase):
         # TODO(phawkins): really we would like to test that there were exactly
         # two kernel launches. However, we have no reliable way to determine
         # that.
-        self.assert_(MetadataHasXlaRunOp(run_metadata))
+        self.assertTrue(MetadataHasXlaRunOp(run_metadata))
 
         expected = np.square(np.dot(dx, dw) + db)
         self.assertAllClose(expected, output, rtol=1e-1)
@@ -297,7 +301,7 @@ class XlaCompilationTest(test.TestCase):
           run_metadata=run_metadata,
           options=config_pb2.RunOptions(
               trace_level=config_pb2.RunOptions.FULL_TRACE))
-      self.assert_(MetadataHasXlaRunOp(run_metadata))
+      self.assertTrue(MetadataHasXlaRunOp(run_metadata))
       self.assertAllClose(np.array([[1, 2, 3], [4, 5, 6]], np.float32), out)
 
   def testIgnoredArguments(self):
@@ -325,7 +329,7 @@ class XlaCompilationTest(test.TestCase):
           run_metadata=run_metadata,
           options=config_pb2.RunOptions(
               trace_level=config_pb2.RunOptions.FULL_TRACE))
-      self.assert_(MetadataHasXlaRunOp(run_metadata))
+      self.assertTrue(MetadataHasXlaRunOp(run_metadata))
       self.assertAllClose(28, out)
 
   def testLoops(self):
@@ -336,14 +340,14 @@ class XlaCompilationTest(test.TestCase):
       with jit_scope():
         c = lambda i, _: math_ops.less(i, 5)
         b = lambda i, x: (i + 1, x * 2.0 + 1.0)
-        _, y = control_flow_ops.while_loop(c, b, (constant_op.constant(0), x))
+        _, y = while_loop.while_loop(c, b, (constant_op.constant(0), x))
 
       run_metadata = config_pb2.RunMetadata()
       result = session.run(y, {x: np.float32(2)},
                            run_metadata=run_metadata,
                            options=config_pb2.RunOptions(
                                trace_level=config_pb2.RunOptions.FULL_TRACE))
-      self.assert_(MetadataHasXlaRunOp(run_metadata))
+      self.assertTrue(MetadataHasXlaRunOp(run_metadata))
       self.assertAllClose(result, np.float32(95), rtol=1e-1)
 
   def testCond(self):
@@ -355,7 +359,7 @@ class XlaCompilationTest(test.TestCase):
       c = array_ops.placeholder(dtypes.bool)
       with jit_scope():
         z = x + 1.0
-        w = control_flow_ops.cond(c, lambda: z, lambda: y)
+        w = cond.cond(c, lambda: z, lambda: y)
         t = math_ops.add(z, w)
 
       # If JIT compilation chooses to cluster z and t, then execution will
@@ -372,7 +376,7 @@ class XlaCompilationTest(test.TestCase):
           run_metadata=run_metadata,
           options=config_pb2.RunOptions(
               trace_level=config_pb2.RunOptions.FULL_TRACE))
-      self.assert_(MetadataHasXlaRunOp(run_metadata))
+      self.assertTrue(MetadataHasXlaRunOp(run_metadata))
       self.assertAllClose(result, np.float32(6), rtol=1e-1)
 
   def testNestedFunction(self):
@@ -413,8 +417,7 @@ class XlaCompilationTest(test.TestCase):
         y = x + 1.0
         c = lambda i, _x, _y: math_ops.less(i, 5)
         b = lambda i, x, _y: (i + 1, x * 2.0 + 1.0, x - 3.0)
-        _, _, w = control_flow_ops.while_loop(c, b,
-                                              (constant_op.constant(0), y, x))
+        _, _, w = while_loop.while_loop(c, b, (constant_op.constant(0), y, x))
         u = w + y
       result = session.run(u, {x: np.float32(2)})
       self.assertAllClose(result, np.float32(63), rtol=1e-1)
@@ -509,24 +512,6 @@ class ElementWiseFusionTest(test.TestCase):
       self.assertEqual(xla_compile_count, xla_run_count)
 
       return output, xla_run_count
-
-  def testElementWiseClustering(self):
-    arg0 = np.random.rand(2, 2).astype(np.float32)
-    arg1 = np.random.rand(2, 2).astype(np.float32)
-    old_tf_xla_flags = os.environ.get("TF_XLA_FLAGS", "")
-    os.environ["TF_XLA_FLAGS"] = ("--tf_xla_fusion_only=true "
-                                  "--tf_xla_min_cluster_size=2 "
-                                  "--tf_xla_cpu_global_jit " + old_tf_xla_flags)
-    tf_op, tf_count = self.simpleTest(arg0, arg1,
-                                      config_pb2.OptimizerOptions.OFF)
-    self.assertEqual(0, tf_count)
-
-    tfef_op, tfef_count = self.simpleTest(arg0, arg1,
-                                          config_pb2.OptimizerOptions.ON_1)
-    self.assertEqual(2, tfef_count)
-
-    self.assertAllClose(tf_op, tfef_op, rtol=1e-1)
-    os.environ["TF_XLA_FLAGS"] = old_tf_xla_flags
 
 
 class LazyCompilationTest(test.TestCase):
@@ -660,4 +645,7 @@ class LazyCompilationTest(test.TestCase):
 if __name__ == "__main__":
   os.environ["TF_XLA_FLAGS"] = ("--tf_xla_enable_lazy_compilation=true " +
                                 os.environ.get("TF_XLA_FLAGS", ""))
+  # This test is using Tensorflow sessions which are not compatible with eager
+  # mode.
+  ops.disable_eager_execution()
   test.main()

@@ -19,6 +19,7 @@ limitations under the License.
 #include <assert.h>
 #include <stdint.h>
 #include <sys/types.h>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -26,7 +27,7 @@ limitations under the License.
 #include <tuple>
 #include <type_traits>
 
-#include "tensorflow/lite/c/builtin_op_data.h"
+#include "tensorflow/lite/core/c/builtin_op_data.h"
 #include "tensorflow/lite/kernels/internal/common.h"
 #include "tensorflow/lite/kernels/internal/optimized/eigen_spatial_convolutions.h"
 #include "tensorflow/lite/kernels/internal/optimized/optimized_ops.h"
@@ -41,7 +42,7 @@ typedef Eigen::TensorMap<
     Eigen::Tensor<float, 2, Eigen::RowMajor, Eigen::DenseIndex>, Eigen::Aligned>
     EigenMatrix;
 typedef Eigen::TensorMap<
-    Eigen::Tensor<const float, 2, Eigen::RowMajor, Eigen::DenseIndex>,
+    const Eigen::Tensor<float, 2, Eigen::RowMajor, Eigen::DenseIndex>,
     Eigen::Aligned>
     ConstEigenMatrix;
 
@@ -49,7 +50,7 @@ typedef Eigen::TensorMap<
     Eigen::Tensor<float, 4, Eigen::RowMajor, Eigen::DenseIndex>, Eigen::Aligned>
     EigenTensor;
 typedef Eigen::TensorMap<
-    Eigen::Tensor<const float, 4, Eigen::RowMajor, Eigen::DenseIndex>,
+    const Eigen::Tensor<float, 4, Eigen::RowMajor, Eigen::DenseIndex>,
     Eigen::Aligned>
     ConstEigenTensor;
 
@@ -85,12 +86,12 @@ class EigenTensorConvFunctor {
 
  public:
   void operator()(const Eigen::ThreadPoolDevice& device, const T* input_data,
-                  T* im2col_buffer, int input_batches, int input_height,
-                  int input_width, int input_depth, const T* filter_data,
-                  int filter_height, int filter_width, int filter_count,
-                  int stride_rows, int stride_cols, int pad_width,
-                  int pad_height, PaddingType padding, T* output_data,
-                  int output_height, int output_width) {
+                  int input_batches, int input_height, int input_width,
+                  int input_depth, const T* filter_data, int filter_height,
+                  int filter_width, int filter_count, int stride_rows,
+                  int stride_cols, int pad_width, int pad_height,
+                  PaddingType padding, T* output_data, int output_height,
+                  int output_width) {
     const bool is_1x1_kernel = (filter_height == 1 && filter_width == 1 &&
                                 stride_rows == 1 && stride_cols == 1);
     if (is_1x1_kernel) {
@@ -139,6 +140,13 @@ inline void Conv(const Eigen::ThreadPoolDevice& device,
                  const float* bias_data, const RuntimeShape& output_shape,
                  float* output_data, const RuntimeShape& im2col_shape,
                  float* im2col_data) {
+  // Nest profiling under "Conv", to aggregate with other kernels.
+  ruy::profiler::ScopeLabel label("Conv");
+  ruy::profiler::ScopeLabel inner_label("Multithreaded EigenTensor");
+
+  // im2col data should not be generated for the multi-thread supporting case.
+  TFLITE_DCHECK(!im2col_data);
+  (void)im2col_shape;
   const int stride_width = params.stride_width;
   const int stride_height = params.stride_height;
   const PaddingType padding = params.padding_type;
@@ -160,11 +168,10 @@ inline void Conv(const Eigen::ThreadPoolDevice& device,
   const int output_height = output_shape.Dims(1);
   const int output_width = output_shape.Dims(2);
   EigenTensorConvFunctor<float> conv_functor;
-  conv_functor(device, input_data, im2col_data, batches, input_height,
-               input_width, input_depth, filter_data, filter_height,
-               filter_width, output_depth, stride_height, stride_width,
-               pad_height, pad_width, padding, output_data, output_height,
-               output_width);
+  conv_functor(device, input_data, batches, input_height, input_width,
+               input_depth, filter_data, filter_height, filter_width,
+               output_depth, stride_height, stride_width, pad_height, pad_width,
+               padding, output_data, output_height, output_width);
 
   optimized_ops::AddBiasAndEvalActivationFunction(
       output_activation_min, output_activation_max, bias_shape, bias_data,

@@ -40,7 +40,6 @@ struct GrapplerItem;
 // with static shape inference.
 class AnalyticalCostEstimator : public CostEstimator {
  public:
-  // Does not take ownership of cluster.
   AnalyticalCostEstimator(Cluster* cluster, bool use_static_shapes,
                           bool use_aggressive_shape_inference);
   AnalyticalCostEstimator(Cluster* cluster,
@@ -48,23 +47,28 @@ class AnalyticalCostEstimator : public CostEstimator {
                           std::unique_ptr<ReadyNodeManager> node_manager,
                           bool use_static_shapes,
                           bool use_aggressive_shape_inference);
+  AnalyticalCostEstimator(Cluster* cluster,
+                          std::unique_ptr<OpLevelCostEstimator> node_estimator,
+                          std::unique_ptr<ReadyNodeManager> node_manager,
+                          std::unique_ptr<VirtualPlacer> placer,
+                          bool use_static_shapes,
+                          bool use_aggressive_shape_inference);
   ~AnalyticalCostEstimator() override {}
 
-  // Initializes the estimator for the specified grappler item.
   // This implementation always returns OK.
-  Status Initialize(const GrapplerItem& item) override;
+  absl::Status Initialize(const GrapplerItem& item) override;
 
   // Predict the performance of each node of the optimized graph and annotate
   // the RunMetadata with the corresponding estimates. Also returns the
   // expected cost for the whole graph.
-  Status PredictCosts(const GraphDef& optimized_graph,
-                      RunMetadata* run_metadata, Costs* cost) const override;
+  absl::Status PredictCosts(const GraphDef& optimized_graph,
+                            RunMetadata* run_metadata,
+                            Costs* cost) const override;
 
   const VirtualScheduler* GetScheduler() const { return scheduler_.get(); }
 
  private:
-  Cluster* cluster_;
-  GrapplerItem item_;
+  const GrapplerItem* item_;
   std::unique_ptr<OpLevelCostEstimator> node_estimator_;
   std::unique_ptr<ReadyNodeManager> node_manager_;
   std::unique_ptr<VirtualScheduler> scheduler_;

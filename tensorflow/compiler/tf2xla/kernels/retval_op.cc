@@ -13,14 +13,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "tensorflow/compiler/tf2xla/shape_util.h"
 #include "tensorflow/compiler/tf2xla/xla_context.h"
 #include "tensorflow/compiler/tf2xla/xla_op_kernel.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
-#include "tensorflow/compiler/xla/client/xla_builder.h"
-#include "tensorflow/compiler/xla/status_macros.h"
-#include "tensorflow/core/framework/kernel_def_builder.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/framework/op_requires.h"
+#include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/framework/types.pb.h"
+#include "tensorflow/core/platform/errors.h"
 
 namespace tensorflow {
 namespace {
@@ -37,9 +38,11 @@ class RetvalOp : public XlaOpKernel {
   void Compile(XlaOpKernelContext* ctx) override {
     const Tensor& input = ctx->op_kernel_context()->input(0);
 
-    // DT_VARIANT types represent Tensor Lists and are wrapped in a DT_UINT8
-    // tensor so we skip the check here.
-    if (dtype_ != DT_VARIANT) {
+    // Types that cannot be copied using memcpy (like DT_VARIANT types that
+    // represent Tensor Lists) are wrapped in a DT_UINT8 and hence the type
+    // mismatches. Skip the test in such cases. See
+    // XlaOpKernelContext::SetOutputExpression for details.
+    if (DataTypeCanUseMemcpy(dtype_)) {
       OP_REQUIRES(ctx, input.dtype() == dtype_,
                   errors::InvalidArgument(
                       "Type mismatch: actual ", DataTypeString(input.dtype()),
@@ -60,7 +63,8 @@ class RetvalOp : public XlaOpKernel {
   int index_;
   DataType dtype_;
 
-  TF_DISALLOW_COPY_AND_ASSIGN(RetvalOp);
+  RetvalOp(const RetvalOp&) = delete;
+  void operator=(const RetvalOp&) = delete;
 };
 
 REGISTER_XLA_OP(

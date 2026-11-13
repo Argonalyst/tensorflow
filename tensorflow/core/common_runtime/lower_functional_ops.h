@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef TENSORFLOW_CORE_COMMON_RUNTIME_LOWER_FUNCTIONAL_OPS_H_
 #define TENSORFLOW_CORE_COMMON_RUNTIME_LOWER_FUNCTIONAL_OPS_H_
 
+#include "absl/types/optional.h"
+#include "tensorflow/core/common_runtime/inline_function_utils.h"
 #include "tensorflow/core/common_runtime/optimization_registry.h"
 #include "tensorflow/core/lib/core/status.h"
 
@@ -31,20 +33,13 @@ namespace tensorflow {
 class LowerFunctionalOpsPass : public GraphOptimizationPass {
  public:
   LowerFunctionalOpsPass() = default;
-  explicit LowerFunctionalOpsPass(bool lower_function_calls)
-      : lower_function_calls_(lower_function_calls) {}
 
-  Status Run(const GraphOptimizationPassOptions& options) override;
+  absl::Status Run(const GraphOptimizationPassOptions& options) override;
 
   static constexpr const char* const kLowerUsingSwitchMergeAttr =
-      "_lower_using_switch_merge";
+      LowerFunctionalOpsConstants::kLowerUsingSwitchMergeAttr;
   static constexpr const char* const kLowerAsMultiDeviceFunctionAttr =
-      "_lower_as_multi_device_function";
-
- private:
-  // TODO(ezhulenev): This is only required until Grappler function optimizer is
-  // not migrated to use function inlining from common_runtime.
-  bool lower_function_calls_ = true;
+      LowerFunctionalOpsConstants::kLowerAsMultiDeviceFunctionAttr;
 };
 
 }  // namespace tensorflow

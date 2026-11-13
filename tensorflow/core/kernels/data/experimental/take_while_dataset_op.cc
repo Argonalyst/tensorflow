@@ -12,105 +12,69 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include <iterator>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
 #include "tensorflow/core/common_runtime/function.h"
+#include "tensorflow/core/common_runtime/input_colocation_exemption_registry.h"
+#include "tensorflow/core/data/captured_function.h"
+#include "tensorflow/core/data/dataset_utils.h"
+#include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/dataset.h"
+#include "tensorflow/core/framework/dataset_options.pb.h"
 #include "tensorflow/core/framework/partial_tensor_shape.h"
 #include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/kernels/data/captured_function.h"
-#include "tensorflow/core/kernels/data/dataset_utils.h"
-#include "tensorflow/core/util/ptr_util.h"
+#include "tensorflow/core/framework/types.pb.h"
 
 namespace tensorflow {
 namespace data {
+namespace experimental {
 namespace {
 
-// See documentation in ../../ops/dataset_ops.cc for a high-level
-// description of the following op.
+constexpr char kInputImplEmpty[] = "input_impl_empty";
 
 class TakeWhileDatasetOp : public UnaryDatasetOpKernel {
  public:
-  using LoopIteratorPredicate =
-      std::function<Status(IteratorContext*, InstantiatedCapturedFunction*,
-                           std::vector<Tensor>&, bool*)>;
-
   explicit TakeWhileDatasetOp(OpKernelConstruction* ctx)
       : UnaryDatasetOpKernel(ctx) {
-    OP_REQUIRES_OK(ctx, ctx->GetAttr("predicate", &func_));
-    OP_REQUIRES_OK(
-        ctx, ComputeShortCircuitIndices(ctx, func_, &short_circuit_indices_));
-    OP_REQUIRES(
-        ctx, short_circuit_indices_.size() <= 1,
-        errors::InvalidArgument("`predicate` has more than one return value."));
+    OP_REQUIRES_OK(ctx, FunctionMetadata::Create(
+                            ctx, "predicate", /*params=*/{}, &func_metadata_));
+    OP_REQUIRES(ctx, func_metadata_->short_circuit_info().indices.size() <= 1,
+                absl::InvalidArgumentError(
+                    "predicate function has more than one return value."));
   }
 
   void MakeDataset(OpKernelContext* ctx, DatasetBase* input,
                    DatasetBase** output) override {
     std::unique_ptr<CapturedFunction> captured_func;
-    OP_REQUIRES_OK(ctx,
-                   CapturedFunction::Create(func_, ctx, "other_arguments",
-                                            /*params=*/{}, &captured_func));
-
-    LoopIteratorPredicate loop_pred;
-    if (short_circuit_indices_.empty()) {
-      loop_pred = [](IteratorContext* ctx,
-                     InstantiatedCapturedFunction* inst_captured_func,
-                     const std::vector<Tensor>& args, bool* end_of_sequence) {
-        std::vector<Tensor> result;
-        TF_RETURN_IF_ERROR(
-            inst_captured_func->RunWithBorrowedArgs(ctx, args, &result));
-
-        if (result.size() != 1 || result[0].dtype() != DT_BOOL ||
-            result[0].NumElements() != 1) {
-          return errors::InvalidArgument(
-              "`predicate` must returns a scalar bool tensor.");
-        }
-        *end_of_sequence = !result[0].scalar<bool>()();
-        return Status::OK();
-      };
-    } else {
-      int predicate_index = short_circuit_indices_[0];
-      loop_pred = [predicate_index](
-                      IteratorContext* ctx,
-                      InstantiatedCapturedFunction* inst_captured_func,
-                      const std::vector<Tensor>& args, bool* end_of_sequence) {
-        const Tensor& predicate = args[predicate_index];
-        if (predicate.dtype() != DT_BOOL || predicate.NumElements() != 1) {
-          return errors::InvalidArgument(
-              "`predicate` must returns a scalar bool tensor.");
-        }
-        *end_of_sequence = !predicate.scalar<bool>()();
-        return Status::OK();
-      };
-    }
-    *output = new Dataset(ctx, input, func_, std::move(captured_func),
-                          std::move(loop_pred));
+    OP_REQUIRES_OK(
+        ctx, CapturedFunction::Create(ctx, func_metadata_, "other_arguments",
+                                      &captured_func));
+    *output = new Dataset(ctx, input, std::move(captured_func));
   }
 
  private:
   class Dataset : public DatasetBase {
    public:
     Dataset(OpKernelContext* ctx, const DatasetBase* input,
-            const NameAttrList& func,
-            std::unique_ptr<CapturedFunction> captured_func,
-            LoopIteratorPredicate loop_pred)
+            std::unique_ptr<CapturedFunction> captured_func)
         : DatasetBase(DatasetContext(ctx)),
           input_(input),
-          func_(func),
-          captured_func_(std::move(captured_func)),
-          loop_pred_(std::move(loop_pred)) {
+          captured_func_(std::move(captured_func)) {
       input_->Ref();
     }
 
     ~Dataset() override { input_->Unref(); }
 
     std::unique_ptr<IteratorBase> MakeIteratorInternal(
-        const string& prefix) const override {
-      return MakeUnique<Iterator>(
-          Iterator::Params{this, strings::StrCat(prefix, "::TakeWhile")},
-          loop_pred_);
+        const std::string& prefix) const override {
+      return std::make_unique<Iterator>(
+          Iterator::Params{this, absl::StrCat(prefix, "::TakeWhile")});
     }
 
     const DataTypeVector& output_dtypes() const override {
@@ -121,38 +85,38 @@ class TakeWhileDatasetOp : public UnaryDatasetOpKernel {
       return input_->output_shapes();
     }
 
-    string DebugString() const override {
+    std::string DebugString() const override {
       return "TakeWhileDatasetOp::Dataset";
     }
 
-    int64 Cardinality() const override { return kUnknownCardinality; }
+    int64_t CardinalityInternal(CardinalityOptions options) const override {
+      return kUnknownCardinality;
+    }
+
+    absl::Status InputDatasets(
+        std::vector<const DatasetBase*>* inputs) const override {
+      inputs->push_back(input_);
+      return absl::OkStatus();
+    }
+
+    absl::Status CheckExternalState() const override {
+      TF_RETURN_IF_ERROR(captured_func_->CheckExternalState());
+      return input_->CheckExternalState();
+    }
 
    protected:
-    Status AsGraphDefInternal(SerializationContext* ctx,
-                              DatasetGraphDefBuilder* b,
-                              Node** output) const override {
-      TF_RETURN_IF_ERROR(b->AddFunction(ctx, func_.name()));
+    absl::Status AsGraphDefInternal(SerializationContext* ctx,
+                                    DatasetGraphDefBuilder* b,
+                                    Node** output) const override {
       Node* input_node;
       TF_RETURN_IF_ERROR(b->AddInputDataset(ctx, input_, &input_node));
 
       std::vector<Node*> other_arguments;
-      other_arguments.reserve(captured_func_->captured_inputs().size());
       DataTypeVector other_arguments_types;
-      other_arguments_types.reserve(captured_func_->captured_inputs().size());
-      for (const Tensor& t : captured_func_->captured_inputs()) {
-        Node* node;
-        DatasetBase* input;
-        Status s = GetDatasetFromVariantTensor(t, &input);
-        if (s.ok()) {
-          TF_RETURN_IF_ERROR(b->AddInputDataset(ctx, input, &node));
-        } else {
-          TF_RETURN_IF_ERROR(b->AddTensor(t, &node));
-        }
-        other_arguments.emplace_back(node);
-        other_arguments_types.emplace_back(t.dtype());
-      }
+      TF_RETURN_IF_ERROR(captured_func_->AddToGraph(ctx, b, &other_arguments,
+                                                    &other_arguments_types));
       AttrValue f_attr;
-      b->BuildAttrValue(func_, &f_attr);
+      b->BuildAttrValue(captured_func_->func(), &f_attr);
 
       AttrValue other_arguments_types_attr;
       b->BuildAttrValue(other_arguments_types, &other_arguments_types_attr);
@@ -163,30 +127,32 @@ class TakeWhileDatasetOp : public UnaryDatasetOpKernel {
           {std::make_pair("predicate", f_attr),
            std::make_pair("Targuments", other_arguments_types_attr)},
           output));
-      return Status::OK();
+      return absl::OkStatus();
     }
 
    private:
     class Iterator : public DatasetIterator<Dataset> {
      public:
-      explicit Iterator(const Params& params, LoopIteratorPredicate loop_pred)
-          : DatasetIterator<Dataset>(params), loop_pred_(loop_pred) {}
+      explicit Iterator(const Params& params)
+          : DatasetIterator<Dataset>(params) {}
 
-      Status Initialize(IteratorContext* ctx) override {
+      bool SymbolicCheckpointCompatible() const override { return true; }
+
+      absl::Status Initialize(IteratorContext* ctx) override {
         TF_RETURN_IF_ERROR(
-            dataset()->input_->MakeIterator(ctx, prefix(), &input_impl_));
+            dataset()->input_->MakeIterator(ctx, this, prefix(), &input_impl_));
         return dataset()->captured_func_->Instantiate(
             ctx, &instantiated_captured_func_);
       }
 
-      Status GetNextInternal(IteratorContext* ctx,
-                             std::vector<Tensor>* out_tensors,
-                             bool* end_of_sequence) override {
+      absl::Status GetNextInternal(IteratorContext* ctx,
+                                   std::vector<Tensor>* out_tensors,
+                                   bool* end_of_sequence) override {
         {
           tf_shared_lock l(mu_);
           if (!input_impl_) {
             *end_of_sequence = true;
-            return Status::OK();
+            return absl::OkStatus();
           }
           TF_RETURN_IF_ERROR(
               input_impl_->GetNext(ctx, out_tensors, end_of_sequence));
@@ -194,14 +160,24 @@ class TakeWhileDatasetOp : public UnaryDatasetOpKernel {
         if (*end_of_sequence) {
           mutex_lock l(mu_);
           input_impl_.reset();
-          return Status::OK();
+          return absl::OkStatus();
         }
-        TF_RETURN_IF_ERROR(loop_pred_(ctx, instantiated_captured_func_.get(),
-                                      *out_tensors, end_of_sequence));
+        std::vector<Tensor> result;
+        TF_RETURN_IF_ERROR(instantiated_captured_func_->RunWithBorrowedArgs(
+            ctx, *out_tensors, &result, model_node()));
+
+        if (result.size() != 1 || result[0].dtype() != DT_BOOL ||
+            result[0].NumElements() != 1) {
+          return absl::InvalidArgumentError(
+              "`predicate` must returns a scalar bool tensor.");
+        }
+        *end_of_sequence = !result[0].scalar<bool>()();
         if (*end_of_sequence) {
+          mutex_lock l(mu_);
+          input_impl_.reset();
           out_tensors->clear();
         }
-        return Status::OK();
+        return absl::OkStatus();
       }
 
      protected:
@@ -211,46 +187,55 @@ class TakeWhileDatasetOp : public UnaryDatasetOpKernel {
                                          /*ratio=*/1);
       }
 
-      Status SaveInternal(IteratorStateWriter* writer) override {
+      absl::Status SaveInternal(SerializationContext* ctx,
+                                IteratorStateWriter* writer) override {
+        TF_RETURN_IF_ERROR(ctx->HandleCheckExternalStateStatus(
+            dataset()->captured_func_->CheckExternalState()));
         mutex_lock l(mu_);
-        if (input_impl_)
-          TF_RETURN_IF_ERROR(SaveInput(writer, input_impl_));
-        else
-          TF_RETURN_IF_ERROR(
-              writer->WriteScalar(full_name("input_impls_empty"), ""));
-        return Status::OK();
+        TF_RETURN_IF_ERROR(writer->WriteScalar(
+            full_name(kInputImplEmpty), static_cast<int64_t>(!input_impl_)));
+        if (input_impl_) {
+          TF_RETURN_IF_ERROR(SaveInput(ctx, writer, input_impl_));
+        }
+        return absl::OkStatus();
       }
 
-      Status RestoreInternal(IteratorContext* ctx,
-                             IteratorStateReader* reader) override {
+      absl::Status RestoreInternal(IteratorContext* ctx,
+                                   IteratorStateReader* reader) override {
         mutex_lock l(mu_);
-        if (reader->Contains(full_name("input_impls_empty")))
+        int64_t input_empty;
+        TF_RETURN_IF_ERROR(
+            reader->ReadScalar(full_name(kInputImplEmpty), &input_empty));
+        if (static_cast<bool>(input_empty)) {
           input_impl_.reset();
-        else
+        } else {
           TF_RETURN_IF_ERROR(RestoreInput(ctx, reader, input_impl_));
-        return Status::OK();
+        }
+        return absl::OkStatus();
       }
 
      private:
       mutex mu_;
-      std::unique_ptr<IteratorBase> input_impl_ GUARDED_BY(mu_);
+      std::unique_ptr<IteratorBase> input_impl_ TF_GUARDED_BY(mu_);
       std::unique_ptr<InstantiatedCapturedFunction> instantiated_captured_func_;
-      const LoopIteratorPredicate loop_pred_;
     };
 
     const DatasetBase* const input_;
-    const NameAttrList func_;
     const std::unique_ptr<CapturedFunction> captured_func_;
-    const LoopIteratorPredicate loop_pred_;
   };
 
-  NameAttrList func_;
-  std::vector<int> short_circuit_indices_;
+  std::shared_ptr<FunctionMetadata> func_metadata_ = nullptr;
 };
 
+REGISTER_KERNEL_BUILDER(Name("TakeWhileDataset").Device(DEVICE_CPU),
+                        TakeWhileDatasetOp);
 REGISTER_KERNEL_BUILDER(Name("ExperimentalTakeWhileDataset").Device(DEVICE_CPU),
                         TakeWhileDatasetOp);
 
+REGISTER_INPUT_COLOCATION_EXEMPTION("TakeWhileDataset");
+REGISTER_INPUT_COLOCATION_EXEMPTION("ExperimentalTakeWhileDataset");
+
 }  // namespace
+}  // namespace experimental
 }  // namespace data
 }  // namespace tensorflow

@@ -26,8 +26,8 @@ using shape_inference::ShapeHandle;
 namespace {
 
 // Return in <out> the result of making the end of <s> a square matrix.
-Status MakeBatchSquareMatrix(InferenceContext* c, ShapeHandle input,
-                             ShapeHandle* out) {
+absl::Status MakeBatchSquareMatrix(InferenceContext* c, ShapeHandle input,
+                                   ShapeHandle* out) {
   ShapeHandle s;
   TF_RETURN_IF_ERROR(c->WithRankAtLeast(input, 2, &s));
 
@@ -37,19 +37,62 @@ Status MakeBatchSquareMatrix(InferenceContext* c, ShapeHandle input,
   ShapeHandle batch_shape;
   TF_RETURN_IF_ERROR(c->Subshape(s, 0, -2, &batch_shape));
   TF_RETURN_IF_ERROR(c->Concatenate(batch_shape, c->Matrix(d, d), out));
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status BatchUnchangedSquareShapeFn(InferenceContext* c) {
+absl::Status BatchUnchangedSquareShapeFn(InferenceContext* c) {
   ShapeHandle out;
   TF_RETURN_IF_ERROR(MakeBatchSquareMatrix(c, c->input(0), &out));
   c->set_output(0, out);
-  return Status::OK();
+  return absl::OkStatus();
+}
+
+// The first input is [...,K,M] and second input is [...,M,N].
+absl::Status BandedTriangularSolveShapeFn(InferenceContext* c) {
+  ShapeHandle lhs;
+  ShapeHandle rhs;
+
+  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), 2, &lhs));
+  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(1), 2, &rhs));
+
+  // Check K > 0.
+  DimensionHandle num_bands = c->Dim(lhs, -2);
+  DimensionHandle m = c->Dim(lhs, -1);
+  if (c->ValueKnown(num_bands) && c->Value(num_bands) <= 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Number of bands must be positive, but is ", c->Value(num_bands)));
+  }
+  if (c->ValueKnown(num_bands) && c->ValueKnown(m) &&
+      c->Value(num_bands) > c->Value(m)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Number of bands ", c->Value(num_bands),
+                     " cannot exceed the size of the matrix ", c->Value(m)));
+  }
+
+  ShapeHandle lhs_batch_shape;
+  ShapeHandle rhs_batch_shape;
+  ShapeHandle output_batch_shape;
+  // Make the common batch subshape.
+  TF_RETURN_IF_ERROR(c->Subshape(lhs, 0, -2, &lhs_batch_shape));
+  TF_RETURN_IF_ERROR(c->Subshape(rhs, 0, -2, &rhs_batch_shape));
+  TF_RETURN_IF_ERROR(BroadcastBinaryOpOutputShapeFnHelper(
+      c, lhs_batch_shape, rhs_batch_shape, true, &output_batch_shape));
+
+  // lhs and rhs have the same value for M to be compatible.
+  TF_RETURN_IF_ERROR(c->Merge(m, c->Dim(rhs, -2), &m));
+
+  // Build final shape (batch_shape + m + n) in <out>.
+  ShapeHandle out;
+  TF_RETURN_IF_ERROR(
+      c->Concatenate(output_batch_shape, c->Matrix(m, c->Dim(rhs, -1)), &out));
+
+  c->set_output(0, out);
+  return absl::OkStatus();
 }
 
 // The first input is [...,M,N] and second input is either [...,M,K] or [...,M].
 // Output is [...,N,K] or [...,N]. If <square>, then input is [...,M,M].
-Status MatrixSolveShapeFn(InferenceContext* c, bool square) {
+absl::Status MatrixSolveShapeFn(InferenceContext* c, bool square) {
   ShapeHandle lhs;
   ShapeHandle rhs;
   if (square) {
@@ -81,13 +124,41 @@ Status MatrixSolveShapeFn(InferenceContext* c, bool square) {
   TF_RETURN_IF_ERROR(c->Concatenate(lhs_batch_shape, c->Vector(n), &out));
   TF_RETURN_IF_ERROR(c->Concatenate(out, c->Vector(c->Dim(rhs, -1)), &out));
   c->set_output(0, out);
-  return Status::OK();
+  return absl::OkStatus();
+}
+
+// The first input is [...,M,M] and second input is [...,M,N].
+// Output is [...,M,N].
+absl::Status MatrixTriangularSolveShapeFn(InferenceContext* c) {
+  ShapeHandle lhs;
+  ShapeHandle rhs;
+  TF_RETURN_IF_ERROR(MakeBatchSquareMatrix(c, c->input(0), &lhs));
+  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(1), 2, &rhs));
+
+  ShapeHandle lhs_batch_shape;
+  ShapeHandle rhs_batch_shape;
+  ShapeHandle output_batch_shape;
+  // Make the common batch subshape.
+  TF_RETURN_IF_ERROR(c->Subshape(lhs, 0, -2, &lhs_batch_shape));
+  TF_RETURN_IF_ERROR(c->Subshape(rhs, 0, -2, &rhs_batch_shape));
+  TF_RETURN_IF_ERROR(BroadcastBinaryOpOutputShapeFnHelper(
+      c, lhs_batch_shape, rhs_batch_shape, true, &output_batch_shape));
+  DimensionHandle m;
+  // lhs and rhs have the same value for m to be compatible.
+  TF_RETURN_IF_ERROR(c->Merge(c->Dim(lhs, -1), c->Dim(rhs, -2), &m));
+
+  ShapeHandle out;
+  // Build final shape (batch_shape + m + n) in <out>.
+  TF_RETURN_IF_ERROR(
+      c->Concatenate(output_batch_shape, c->Matrix(m, c->Dim(rhs, -1)), &out));
+  c->set_output(0, out);
+  return absl::OkStatus();
 }
 
 // Input is [...,N,N]. Outputs are:
 //   [...,N];[0], if compute_v is false,
 //   [...,N];[...,N,N], if compute_v is true.
-Status SelfAdjointEigV2ShapeFn(InferenceContext* c) {
+absl::Status SelfAdjointEigV2ShapeFn(InferenceContext* c) {
   ShapeHandle input;
   TF_RETURN_IF_ERROR(MakeBatchSquareMatrix(c, c->input(0), &input));
   DimensionHandle n;
@@ -106,13 +177,13 @@ Status SelfAdjointEigV2ShapeFn(InferenceContext* c) {
   } else {
     c->set_output(1, c->Vector(0ll));
   }
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 // Input is [...,N,N].
 // First and second outputs are:
 //   [...,N,N]; [...,N].
-Status LuShapeFn(InferenceContext* c) {
+absl::Status LuShapeFn(InferenceContext* c) {
   ShapeHandle input;
   TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), 2, &input));
 
@@ -130,7 +201,7 @@ Status LuShapeFn(InferenceContext* c) {
 
   c->set_output(0, lu_shape);
   c->set_output(1, p_shape);
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 // Input is [...,M,N].
@@ -138,7 +209,7 @@ Status LuShapeFn(InferenceContext* c) {
 //   [...,M,M]; [...,M,N], if full_matrices is true,
 //   [...,M,P]; [...,P,N], if full_matrices is false,
 // where P = min(M,N).
-Status QrShapeFn(InferenceContext* c) {
+absl::Status QrShapeFn(InferenceContext* c) {
   ShapeHandle input;
   TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), 2, &input));
   DimensionHandle m = c->Dim(input, -2);
@@ -160,7 +231,7 @@ Status QrShapeFn(InferenceContext* c) {
   }
   c->set_output(0, q_shape);
   c->set_output(1, r_shape);
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 // Input is [...,M,N].  First output is [...,min(M,N)].
@@ -169,7 +240,7 @@ Status QrShapeFn(InferenceContext* c) {
 //   [...,M,M]; [...,N,N], if compute_uv is true and full_matrices is true,
 //   [...,M,P]; [...,N,P], if compute_uv is true and full_matrices is false,
 // where P = min(M,N).
-Status SvdShapeFn(InferenceContext* c) {
+absl::Status SvdShapeFn(InferenceContext* c) {
   ShapeHandle input;
   TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), 2, &input));
   DimensionHandle m = c->Dim(input, -2);
@@ -205,12 +276,60 @@ Status SvdShapeFn(InferenceContext* c) {
     c->set_output(1, c->Vector(0ll));
     c->set_output(2, c->Vector(0ll));
   }
-  return Status::OK();
+  return absl::OkStatus();
+}
+
+// Inputs: [...,1,M], [...,1,M], [...,1,M],[...,M,N].
+// Output is [...,M,N].
+absl::Status TridiagonalMatMulShapeFn(InferenceContext* c) {
+  ShapeHandle superdiag;
+  ShapeHandle maindiag;
+  ShapeHandle subdiag;
+  ShapeHandle rhs;
+
+  // Check that rank is at least 2.
+  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), 2, &superdiag));
+  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(1), 2, &maindiag));
+  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(2), 2, &subdiag));
+  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(3), 2, &rhs));
+
+  // Extract batch dimensions and check they are the same.
+  ShapeHandle superdiag_batch_shape;
+  ShapeHandle maindiag_batch_shape;
+  ShapeHandle subdiag_batch_shape;
+  ShapeHandle rhs_batch_shape;
+  TF_RETURN_IF_ERROR(c->Subshape(superdiag, 0, -2, &superdiag_batch_shape));
+  TF_RETURN_IF_ERROR(c->Subshape(maindiag, 0, -2, &maindiag_batch_shape));
+  TF_RETURN_IF_ERROR(c->Subshape(subdiag, 0, -2, &subdiag_batch_shape));
+  TF_RETURN_IF_ERROR(c->Subshape(rhs, 0, -2, &rhs_batch_shape));
+  TF_RETURN_IF_ERROR(c->Merge(superdiag, maindiag, &superdiag));
+  TF_RETURN_IF_ERROR(
+      c->Merge(maindiag_batch_shape, rhs_batch_shape, &rhs_batch_shape));
+  TF_RETURN_IF_ERROR(
+      c->Merge(subdiag_batch_shape, rhs_batch_shape, &rhs_batch_shape));
+
+  // Check that diagonals have the same shape.
+  TF_RETURN_IF_ERROR(c->Merge(superdiag, maindiag, &maindiag));
+  TF_RETURN_IF_ERROR(c->Merge(subdiag, maindiag, &maindiag));
+
+  // Check that size of tri-diagonal matrix is the same as height of matrix on
+  // the right.
+  DimensionHandle m_lhs = c->Dim(maindiag, -1);
+  DimensionHandle m_rhs = c->Dim(rhs, -2);
+  TF_RETURN_IF_ERROR(c->Merge(m_lhs, m_rhs, &m_lhs));
+
+  // Check that next-to-last dimension of diagonals is 1.
+  DimensionHandle unused;
+  TF_RETURN_IF_ERROR(c->WithValue(c->Dim(maindiag, -2), 1, &unused));
+
+  // The output shape is the same as rhs shape.
+  c->set_output(0, rhs);
+  return absl::OkStatus();
 }
 
 // The first input is [...,3,M] and second input is [...,M,K].
 // Output is [...,M,K].
-Status TridiagonalSolveShapeFn(InferenceContext* c) {
+absl::Status TridiagonalSolveShapeFn(InferenceContext* c) {
   ShapeHandle lhs;
   ShapeHandle rhs;
   // Check that rank is at least 2.
@@ -235,7 +354,7 @@ Status TridiagonalSolveShapeFn(InferenceContext* c) {
 
   // The output shape is the same as rhs shape.
   c->set_output(0, rhs);
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace
@@ -255,7 +374,7 @@ REGISTER_OP("MatrixDeterminant")
       ShapeHandle out;
       TF_RETURN_IF_ERROR(c->Subshape(input, 0, -2, &out));
       c->set_output(0, out);
-      return Status::OK();
+      return absl::OkStatus();
     });
 
 REGISTER_OP("LogMatrixDeterminant")
@@ -278,7 +397,7 @@ REGISTER_OP("LogMatrixDeterminant")
       ShapeHandle out;
       TF_RETURN_IF_ERROR(c->Subshape(input, 0, -2, &out));
       c->set_output(1, out);
-      return Status::OK();
+      return absl::OkStatus();
     });
 
 REGISTER_OP("MatrixInverse")
@@ -332,8 +451,17 @@ REGISTER_OP("SelfAdjointEig")
       TF_RETURN_IF_ERROR(c->Subshape(input, 0, -2, &s));
       TF_RETURN_IF_ERROR(c->Concatenate(s, c->Matrix(d_plus_1, d), &s));
       c->set_output(0, s);
-      return Status::OK();
+      return absl::OkStatus();
     });
+
+REGISTER_OP("Eig")
+    .Input("input: T")
+    .Output("e: Tout")
+    .Output("v: Tout")
+    .Attr("compute_v: bool = True")
+    .Attr("T: {float, double, complex64, complex128}")
+    .Attr("Tout: {complex64, complex128}")
+    .SetShapeFn(SelfAdjointEigV2ShapeFn);
 
 REGISTER_OP("SelfAdjointEigV2")
     .Input("input: T")
@@ -361,7 +489,7 @@ REGISTER_OP("MatrixSolve")
       return MatrixSolveShapeFn(c, true /* square (*/);
     });
 
-REGISTER_OP("MatrixTriangularSolve")
+REGISTER_OP("BandedTriangularSolve")
     .Input("matrix: T")
     .Input("rhs: T")
     .Output("output: T")
@@ -369,7 +497,18 @@ REGISTER_OP("MatrixTriangularSolve")
     .Attr("adjoint: bool = False")
     .Attr("T: {double, float, half, complex64, complex128}")
     .SetShapeFn([](InferenceContext* c) {
-      return MatrixSolveShapeFn(c, true /* square (*/);
+      return BandedTriangularSolveShapeFn(c);
+    });
+
+REGISTER_OP("MatrixTriangularSolve")
+    .Input("matrix: T")
+    .Input("rhs: T")
+    .Output("output: T")
+    .Attr("lower: bool = True")
+    .Attr("adjoint: bool = False")
+    .Attr("T: {bfloat16, double, float, half, complex64, complex128}")
+    .SetShapeFn([](InferenceContext* c) {
+      return MatrixTriangularSolveShapeFn(c);
     });
 
 REGISTER_OP("MatrixSolveLs")
@@ -409,12 +548,31 @@ REGISTER_OP("Svd")
     .Attr("T: {double, float, half, complex64, complex128}")
     .SetShapeFn(SvdShapeFn);
 
+REGISTER_OP("TridiagonalMatMul")
+    .Input("superdiag: T")
+    .Input("maindiag: T")
+    .Input("subdiag: T")
+    .Input("rhs: T")
+    .Output("output: T")
+    .Attr("T: {double, float, complex64, complex128}")
+    .SetShapeFn(TridiagonalMatMulShapeFn);
+
 REGISTER_OP("TridiagonalSolve")
     .Input("diagonals: T")
     .Input("rhs: T")
     .Output("output: T")
+    .Attr("partial_pivoting: bool = True")
+    .Attr("perturb_singular: bool = False")
     .Attr("T: {double, float, complex64, complex128}")
     .SetShapeFn(TridiagonalSolveShapeFn);
+
+REGISTER_OP("Einsum")
+    .Input("inputs: N * T")
+    .Output("output: T")
+    .Attr("equation: string")
+    .Attr("N: int >= 1")
+    .Attr("T: type")
+    .SetShapeFn(shape_inference::EinsumShape);
 
 // Deprecated op registrations:
 

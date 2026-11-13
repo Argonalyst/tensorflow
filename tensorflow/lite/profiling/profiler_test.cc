@@ -12,36 +12,39 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include "tensorflow/lite/profiling/profiler.h"
+
 #include <unistd.h>
 
 #include <chrono>  // NOLINT(build/c++11)
 #include <cmath>
 #include <thread>  // NOLINT(build/c++11)
 
-#include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "tensorflow/lite/profiling/profiler.h"
-#include "tensorflow/lite/testing/util.h"
+#include "tensorflow/lite/core/api/profiler.h"
+#include "tensorflow/lite/profiling/buffered_profiler.h"
+#include "tensorflow/lite/profiling/noop_profiler.h"
+#include "tensorflow/lite/profiling/profile_buffer.h"
 
 namespace tflite {
 namespace profiling {
 namespace {
 
 double GetDurationOfEventMs(const ProfileEvent* event) {
-  return (event->end_timestamp_us - event->begin_timestamp_us) / 1e3;
+  return (event->elapsed_time) / 1e3;
 }
 
-void SleepForQuarterSecond(Profiler* profiler) {
+void SleepForQuarterSecond(tflite::Profiler* profiler) {
   ScopedProfile profile(profiler, "SleepForQuarter");
   std::this_thread::sleep_for(std::chrono::milliseconds(250));
 }
 
-void ChildFunction(Profiler* profiler) {
+void ChildFunction(tflite::Profiler* profiler) {
   ScopedProfile profile(profiler, "Child");
   SleepForQuarterSecond(profiler);
 }
 
-void ParentFunction(Profiler* profiler) {
+void ParentFunction(tflite::Profiler* profiler) {
   ScopedProfile profile(profiler, "Parent");
   for (int i = 0; i < 2; i++) {
     ChildFunction(profiler);
@@ -49,14 +52,28 @@ void ParentFunction(Profiler* profiler) {
 }
 
 TEST(ProfilerTest, NoProfilesAreCollectedWhenDisabled) {
-  Profiler profiler;
+  BufferedProfiler profiler(1024);
   ParentFunction(&profiler);
   auto profile_events = profiler.GetProfileEvents();
   EXPECT_EQ(0, profile_events.size());
 }
 
+TEST(ProfilerTest, NoProfilesAreCollectedWhenEventTypeUnsupported) {
+  BufferedProfiler profiler(1024);
+  tflite::Profiler* p = &profiler;
+  p->AddEvent("Hello",
+              Profiler::EventType::GENERAL_RUNTIME_INSTRUMENTATION_EVENT,
+              /*elaped_time*/ 1,
+              /*event_metadata*/ 2);
+  auto handler = p->BeginEvent(
+      "begin", Profiler::EventType::GENERAL_RUNTIME_INSTRUMENTATION_EVENT, 0);
+  p->EndEvent(handler);
+  auto profile_events = profiler.GetProfileEvents();
+  EXPECT_EQ(0, profile_events.size());
+}
+
 TEST(ProfilingTest, ProfilesAreCollected) {
-  Profiler profiler;
+  BufferedProfiler profiler(1024);
   profiler.StartProfiling();
   ParentFunction(&profiler);
   profiler.StopProfiling();
@@ -97,24 +114,27 @@ TEST(ProfilingTest, ProfilesAreCollected) {
 
 TEST(ProfilingTest, NullProfiler) {
   Profiler* profiler = nullptr;
-  { SCOPED_OPERATOR_PROFILE(profiler, 1); }
+  { SCOPED_TAGGED_OPERATOR_PROFILE(profiler, "noop", 1); }
 }
 
 TEST(ProfilingTest, ScopedProfile) {
-  Profiler profiler;
+  BufferedProfiler profiler(1024);
   profiler.StartProfiling();
-  { SCOPED_OPERATOR_PROFILE(&profiler, 1); }
+  { SCOPED_TAGGED_OPERATOR_PROFILE(&profiler, "noop", 1); }
   profiler.StopProfiling();
   auto profile_events = profiler.GetProfileEvents();
   EXPECT_EQ(1, profile_events.size());
 }
 
+TEST(ProfilingTest, NoopProfiler) {
+  NoopProfiler profiler;
+  profiler.StartProfiling();
+  { SCOPED_TAGGED_OPERATOR_PROFILE(&profiler, "noop", 1); }
+  profiler.StopProfiling();
+  auto profile_events = profiler.GetProfileEvents();
+  EXPECT_EQ(0, profile_events.size());
+}
+
 }  // namespace
 }  // namespace profiling
 }  // namespace tflite
-
-int main(int argc, char** argv) {
-  ::tflite::LogToStderr();
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}

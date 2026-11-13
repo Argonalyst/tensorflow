@@ -12,39 +12,27 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include <cstddef>
 #include <memory>
-#include <string>
-#include <unordered_map>
 #include <vector>
 
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "tensorflow/core/platform/logging.h"
+#include "tensorflow/core/platform/status.h"
 #include "tensorflow/lite/toco/graph_transformations/graph_transformations.h"
 #include "tensorflow/lite/toco/model.h"
 #include "tensorflow/lite/toco/tooling_util.h"
-#include "tensorflow/core/platform/logging.h"
 
 namespace toco {
 
-namespace {
-
-std::vector<std::unique_ptr<Operator>>::iterator FindOperator(
-    Model* model, const Operator* op) {
-  auto it = model->operators.begin();
-  for (; it != model->operators.end(); ++it) {
-    if (it->get() == op) {
-      break;
-    }
-  }
-  return it;
-}
-}  // namespace
-
-::tensorflow::Status IdentifyL2Pool::Run(Model* model, std::size_t op_index,
-                                         bool* modified) {
+absl::Status IdentifyL2Pool::Run(Model* model, std::size_t op_index,
+                                 bool* modified) {
   *modified = false;
   const auto sqrt_it = model->operators.begin() + op_index;
   const auto* sqrt_op = sqrt_it->get();
   if (sqrt_op->type != OperatorType::kSqrt) {
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
 
   CHECK_EQ(sqrt_op->inputs.size(), 1);
@@ -58,7 +46,7 @@ std::vector<std::unique_ptr<Operator>>::iterator FindOperator(
     AddMessageF(
         "Giving up trying to identify L2Pool subgraph: "
         "expected AveragePool op, but Sqrt op has no preceding op");
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
 
   if (prev_to_sqrt_op->type != OperatorType::kAveragePool) {
@@ -66,7 +54,7 @@ std::vector<std::unique_ptr<Operator>>::iterator FindOperator(
         "Giving up trying to identify L2Pool subgraph: "
         "expected AveragePool op, got %s",
         LogName(*prev_to_sqrt_op));
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
 
   avpool_op = static_cast<const AveragePoolOperator*>(prev_to_sqrt_op);
@@ -79,7 +67,7 @@ std::vector<std::unique_ptr<Operator>>::iterator FindOperator(
         "Giving up trying to identify L2Pool subgraph: "
         "expected Square op, got %s",
         LogName(*square_op));
-    return ::tensorflow::Status::OK();
+    return absl::OkStatus();
   }
 
   // Create and emplace L2Pool node.
@@ -100,17 +88,12 @@ std::vector<std::unique_ptr<Operator>>::iterator FindOperator(
 
   AddMessageF("Creating %s replacing equivalent subgraph", LogName(*l2pool_op));
 
-  // Erase intermediate arrays, keeping input to square op.
-  model->EraseArray(avpool_op->inputs[0]);
-  model->EraseArray(sqrt_op->inputs[0]);
-
-  // Erase three operators being replaced.
-  model->operators.erase(FindOperator(model, square_op));
-  model->operators.erase(FindOperator(model, avpool_op));
-  model->operators.erase(FindOperator(model, sqrt_op));
+  DeleteOpAndArrays(model, square_op);
+  DeleteOpAndArrays(model, avpool_op);
+  DeleteOpAndArrays(model, sqrt_op);
 
   *modified = true;
-  return ::tensorflow::Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace toco

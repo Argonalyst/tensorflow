@@ -15,9 +15,8 @@ limitations under the License.
 
 #include "tensorflow/lite/minimal_logging.h"
 
-#include <string>
-
 #include <gtest/gtest.h>
+#include "tensorflow/lite/logger.h"
 
 namespace tflite {
 
@@ -47,14 +46,68 @@ TEST(MinimalLogging, Error) {
 
 TEST(MinimalLogging, UnknownSeverity) {
   testing::internal::CaptureStderr();
+  LogSeverity default_log_severity = TFLITE_LOG_INFO;
+#if defined(__ANDROID__) || !defined(NDEBUG)
+  default_log_severity = TFLITE_LOG_VERBOSE;
+#endif
+  EXPECT_EQ(tflite::logging_internal::MinimalLogger::SetMinimumLogSeverity(
+                static_cast<LogSeverity>(-1)),
+            default_log_severity);
   TFLITE_LOG_PROD(static_cast<LogSeverity>(-1), "Three");
   EXPECT_EQ("<Unknown severity>: Three\n",
             testing::internal::GetCapturedStderr());
+  tflite::logging_internal::MinimalLogger::SetMinimumLogSeverity(
+      default_log_severity);
+}
+
+TEST(MinimalLogging, MinimumSeverity) {
+  testing::internal::CaptureStderr();
+  LogSeverity default_log_severity = TFLITE_LOG_INFO;
+#if defined(__ANDROID__) || !defined(NDEBUG)
+  default_log_severity = TFLITE_LOG_VERBOSE;
+#endif
+
+  EXPECT_EQ(tflite::logging_internal::MinimalLogger::SetMinimumLogSeverity(
+                TFLITE_LOG_WARNING),
+            default_log_severity);
+  TFLITE_LOG_PROD(TFLITE_LOG_WARNING, "Foo");
+  TFLITE_LOG_PROD(default_log_severity, "Bar");
+  EXPECT_EQ("WARNING: Foo\n", testing::internal::GetCapturedStderr());
+  tflite::logging_internal::MinimalLogger::SetMinimumLogSeverity(
+      default_log_severity);
+}
+
+TEST(MinimalLogging, Once) {
+  testing::internal::CaptureStderr();
+  for (int i = 0; i < 10; ++i) {
+    TFLITE_LOG_PROD_ONCE(TFLITE_LOG_INFO, "Count: %d", i);
+  }
+  EXPECT_EQ("INFO: Count: 0\n", testing::internal::GetCapturedStderr());
+}
+
+TEST(MinimalLogging, Debug) {
+  testing::internal::CaptureStderr();
+  TFLITE_LOG(TFLITE_LOG_INFO, "Foo");
+  TFLITE_LOG(TFLITE_LOG_WARNING, "Bar");
+  TFLITE_LOG(TFLITE_LOG_ERROR, "Baz");
+#ifndef NDEBUG
+  EXPECT_EQ("INFO: Foo\nWARNING: Bar\nERROR: Baz\n",
+            testing::internal::GetCapturedStderr());
+#else
+  EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+#endif
+}
+
+TEST(MinimalLogging, DebugOnce) {
+  testing::internal::CaptureStderr();
+  for (int i = 0; i < 10; ++i) {
+    TFLITE_LOG_ONCE(TFLITE_LOG_INFO, "Count: %d", i);
+  }
+#ifndef NDEBUG
+  EXPECT_EQ("INFO: Count: 0\n", testing::internal::GetCapturedStderr());
+#else
+  EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+#endif
 }
 
 }  // namespace tflite
-
-int main(int argc, char** argv) {
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}

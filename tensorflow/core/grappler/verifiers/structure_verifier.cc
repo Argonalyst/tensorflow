@@ -31,7 +31,7 @@ namespace tensorflow {
 namespace grappler {
 
 // TODO(ashwinm): Expand this to add more structural checks.
-Status StructureVerifier::Verify(const GraphDef& graph) {
+absl::Status StructureVerifier::Verify(const GraphDef& graph) {
   StatusGroup status_group;
 
   FunctionLibraryDefinition function_library(OpRegistry::Global(),
@@ -42,7 +42,7 @@ Status StructureVerifier::Verify(const GraphDef& graph) {
 
   std::vector<const NodeDef*> topo_order;
   status_group.Update(ComputeTopologicalOrder(graph, &topo_order));
-  return status_group.as_status();
+  return status_group.as_concatenated_status();
 }
 
 }  // end namespace grappler

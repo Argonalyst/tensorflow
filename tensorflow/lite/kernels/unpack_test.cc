@@ -12,17 +12,23 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
+#include <stdint.h>
+
+#include <initializer_list>
+#include <limits>
 #include <vector>
+
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "tensorflow/lite/interpreter.h"
-#include "tensorflow/lite/kernels/register.h"
+#include "tensorflow/lite/c/c_api_types.h"
 #include "tensorflow/lite/kernels/test_util.h"
-#include "tensorflow/lite/model.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/types/half.h"
 
 namespace tflite {
 namespace {
 
-using ::testing::ElementsAre;
+using ::testing::ElementsAreArray;
 
 template <typename T>
 class UnpackOpModel : public SingleOpModel {
@@ -41,15 +47,19 @@ class UnpackOpModel : public SingleOpModel {
     BuildInterpreter({GetShape(input_)});
   }
 
-  void SetInput(std::initializer_list<T> data) {
-    PopulateTensor<T>(input_, data);
+  // In this test, we represent all input and output test data as integers, and
+  // convert it to the intended type here.
+  void SetInput(std::vector<int> data) {
+    std::vector<T> typed_data(data.begin(), data.end());
+    PopulateTensor(input_, typed_data);
   }
 
-  std::vector<std::vector<T>> GetOutputDatas() {
-    std::vector<std::vector<T>> output_datas;
+  std::vector<std::vector<int>> GetOutputDatas() {
+    std::vector<std::vector<int>> output_datas;
     for (const int output : outputs_) {
-      std::cerr << "the output is " << output << std::endl;
-      output_datas.push_back(ExtractVector<T>(output));
+      std::vector<T> typed_output_data = ExtractVector<T>(output);
+      output_datas.emplace_back(typed_output_data.begin(),
+                                typed_output_data.end());
     }
     return output_datas;
   }
@@ -67,199 +77,213 @@ class UnpackOpModel : public SingleOpModel {
   std::vector<int> outputs_;
 };
 
-// float32 tests.
-TEST(UnpackOpTest, FloatThreeOutputs) {
-  UnpackOpModel<float> model({TensorType_FLOAT32, {3, 2}}, 0);
-  model.SetInput({1, 2, 3, 4, 5, 6});
-  model.Invoke();
+class PrepareOnlyUnpackOpModel : public SingleOpModel {
+ public:
+  explicit PrepareOnlyUnpackOpModel(const TensorData& input, int num_outputs,
+                                    int axis) {
+    input_ = AddInput(input);
+    for (int i = 0; i < num_outputs; ++i) {
+      AddOutput(input.type);
+    }
+    SetBuiltinOp(BuiltinOperator_UNPACK, BuiltinOptions_UnpackOptions,
+                 CreateUnpackOptions(builder_, num_outputs, axis).Union());
+    BuildInterpreter({GetShape(input_)}, /*num_threads=*/1,
+                     /*allow_fp32_relax_to_fp16=*/false,
+                     /*apply_delegate=*/false,
+                     /*allocate_and_delegate=*/false);
+  }
 
-  // Check outputs shapes.
-  const std::vector<std::vector<int>>& output_shapes = model.GetOutputShapes();
-  EXPECT_EQ(output_shapes.size(), 3);
-  EXPECT_THAT(output_shapes[0], ElementsAre(2));
-  EXPECT_THAT(output_shapes[1], ElementsAre(2));
-  EXPECT_THAT(output_shapes[2], ElementsAre(2));
+ private:
+  int input_;
+};
 
-  // Check outputs values.
-  const std::vector<std::vector<float>>& output_datas = model.GetOutputDatas();
-  EXPECT_EQ(output_datas.size(), 3);
-  EXPECT_THAT(output_datas[0], ElementsAre(1, 2));
-  EXPECT_THAT(output_datas[1], ElementsAre(3, 4));
-  EXPECT_THAT(output_datas[2], ElementsAre(5, 6));
+TEST(UnpackPrepareTest, RejectsAxisOutsideInt16Range) {
+  PrepareOnlyUnpackOpModel too_large(
+      /*input=*/{TensorType_FLOAT32, {1}}, /*num_outputs=*/1,
+      std::numeric_limits<int16_t>::max() + 1);
+  EXPECT_EQ(too_large.AllocateTensors(), kTfLiteError);
+
+  PrepareOnlyUnpackOpModel too_small(
+      /*input=*/{TensorType_FLOAT32, {1}}, /*num_outputs=*/1,
+      std::numeric_limits<int16_t>::min() - 1);
+  EXPECT_EQ(too_small.AllocateTensors(), kTfLiteError);
 }
 
-TEST(UnpackOpTest, FloatThreeOutputsAxisOne) {
-  UnpackOpModel<float> model({TensorType_FLOAT32, {3, 2}}, 1);
-  model.SetInput({1, 2, 3, 4, 5, 6});
-  model.Invoke();
+template <typename T>
+void Check(int axis, const std::initializer_list<int>& input_shape,
+           const std::initializer_list<int>& input_data,
+           const std::vector<std::vector<int>>& exp_output_shape,
+           const std::vector<std::vector<int>>& exp_output_data,
+           const TensorType& type = TensorType_FLOAT32) {
+  UnpackOpModel<T> m({type, input_shape}, axis);
+  m.SetInput(input_data);
+  ASSERT_EQ(m.Invoke(), kTfLiteOk);
 
   // Check outputs shapes.
-  const std::vector<std::vector<int>>& output_shapes = model.GetOutputShapes();
-  EXPECT_EQ(output_shapes.size(), 2);
-  EXPECT_THAT(output_shapes[0], ElementsAre(3));
-  EXPECT_THAT(output_shapes[1], ElementsAre(3));
+  EXPECT_THAT(m.GetOutputShapes(), ElementsAreArray(exp_output_shape));
 
   // Check outputs values.
-  const std::vector<std::vector<float>>& output_datas = model.GetOutputDatas();
-  EXPECT_EQ(output_datas.size(), 2);
-  EXPECT_THAT(output_datas[0], ElementsAre(1, 3, 5));
-  EXPECT_THAT(output_datas[1], ElementsAre(2, 4, 6));
+  EXPECT_THAT(m.GetOutputDatas(), ElementsAreArray(exp_output_data));
 }
 
-TEST(UnpackOpTest, FloatThreeOutputsNegativeAxisOne) {
-  UnpackOpModel<float> model({TensorType_FLOAT32, {3, 2}}, -1);
-  model.SetInput({1, 2, 3, 4, 5, 6});
-  model.Invoke();
+template <typename InputType>
+struct UnpackOpTest : public ::testing::Test {
+  using TypeToTest = InputType;
+  TensorType TENSOR_TYPE = GetTensorType<InputType>();
+};
 
-  // Check outputs shapes.
-  const std::vector<std::vector<int>>& output_shapes = model.GetOutputShapes();
-  EXPECT_EQ(output_shapes.size(), 2);
-  EXPECT_THAT(output_shapes[0], ElementsAre(3));
-  EXPECT_THAT(output_shapes[1], ElementsAre(3));
+using TestTypes = testing::Types<float, half, Eigen::bfloat16, int32_t, int8_t,
+                                 uint8_t, int16_t>;
+TYPED_TEST_CASE(UnpackOpTest, TestTypes);
 
-  // Check outputs values.
-  const std::vector<std::vector<float>>& output_datas = model.GetOutputDatas();
-  EXPECT_EQ(output_datas.size(), 2);
-  EXPECT_THAT(output_datas[0], ElementsAre(1, 3, 5));
-  EXPECT_THAT(output_datas[1], ElementsAre(2, 4, 6));
+TYPED_TEST(UnpackOpTest, ThreeOutputs) {
+  Check<typename TestFixture::TypeToTest>(
+      /*axis=*/0, /*input_shape=*/{3, 2},
+      /*input_data=*/{1, 2, 3, 4, 5, 6},
+      /*exp_output_shape=*/{{2}, {2}, {2}},
+      /*exp_output_data=*/{{1, 2}, {3, 4}, {5, 6}}, TestFixture::TENSOR_TYPE);
 }
 
-TEST(UnpackOpTest, FloatThreeOutputsNegativeAxisTwo) {
-  UnpackOpModel<float> model({TensorType_FLOAT32, {3, 2}}, -2);
-  model.SetInput({1, 2, 3, 4, 5, 6});
-  model.Invoke();
-
-  // Check outputs shapes.
-  const std::vector<std::vector<int>>& output_shapes = model.GetOutputShapes();
-  EXPECT_EQ(output_shapes.size(), 3);
-  EXPECT_THAT(output_shapes[0], ElementsAre(2));
-  EXPECT_THAT(output_shapes[1], ElementsAre(2));
-  EXPECT_THAT(output_shapes[2], ElementsAre(2));
-
-  // Check outputs values.
-  const std::vector<std::vector<float>>& output_datas = model.GetOutputDatas();
-  EXPECT_EQ(output_datas.size(), 3);
-  EXPECT_THAT(output_datas[0], ElementsAre(1, 2));
-  EXPECT_THAT(output_datas[1], ElementsAre(3, 4));
-  EXPECT_THAT(output_datas[2], ElementsAre(5, 6));
+TYPED_TEST(UnpackOpTest, ThreeOutputsAxisOne) {
+  Check<typename TestFixture::TypeToTest>(
+      /*axis=*/1, /*input_shape=*/{3, 2},
+      /*input_data=*/{1, 2, 3, 4, 5, 6},
+      /*exp_output_shape=*/{{3}, {3}},
+      /*exp_output_data=*/{{1, 3, 5}, {2, 4, 6}}, TestFixture::TENSOR_TYPE);
 }
 
-TEST(UnpackOpTest, FloatOneOutput) {
-  UnpackOpModel<float> model({TensorType_FLOAT32, {1, 6}}, 0);
-  model.SetInput({1, 2, 3, 4, 5, 6});
-  model.Invoke();
-
-  // Check outputs shapes.
-  const std::vector<std::vector<int>>& output_shapes = model.GetOutputShapes();
-  EXPECT_EQ(output_shapes.size(), 1);
-  EXPECT_THAT(output_shapes[0], ElementsAre(6));
-
-  // Check outputs values.
-  const std::vector<std::vector<float>>& output_datas = model.GetOutputDatas();
-  EXPECT_EQ(output_datas.size(), 1);
-  EXPECT_THAT(output_datas[0], ElementsAre(1, 2, 3, 4, 5, 6));
+TYPED_TEST(UnpackOpTest, ThreeOutputsNegativeAxisOne) {
+  Check<typename TestFixture::TypeToTest>(
+      /*axis=*/-1, /*input_shape=*/{3, 2},
+      /*input_data=*/{1, 2, 3, 4, 5, 6},
+      /*exp_output_shape=*/{{3}, {3}},
+      /*exp_output_data=*/{{1, 3, 5}, {2, 4, 6}}, TestFixture::TENSOR_TYPE);
 }
 
-TEST(UnpackOpTest, FloatThreeDimensionsOutputs) {
-  UnpackOpModel<float> model({TensorType_FLOAT32, {2, 2, 2}}, 2);
-  model.SetInput({1, 2, 3, 4, 5, 6, 7, 8});
-  model.Invoke();
-
-  // Check outputs shapes.
-  const std::vector<std::vector<int>>& output_shapes = model.GetOutputShapes();
-  EXPECT_EQ(output_shapes.size(), 2);
-  EXPECT_THAT(output_shapes[0], ElementsAre(2, 2));
-  EXPECT_THAT(output_shapes[1], ElementsAre(2, 2));
-
-  // Check outputs values.
-  const std::vector<std::vector<float>>& output_datas = model.GetOutputDatas();
-  EXPECT_EQ(output_datas.size(), 2);
-  EXPECT_THAT(output_datas[0], ElementsAre(1, 3, 5, 7));
-  EXPECT_THAT(output_datas[1], ElementsAre(2, 4, 6, 8));
+TYPED_TEST(UnpackOpTest, OneOutput) {
+  Check<typename TestFixture::TypeToTest>(
+      /*axis=*/0, /*input_shape=*/{1, 6},
+      /*input_data=*/{1, 2, 3, 4, 5, 6},
+      /*exp_output_shape=*/{{6}},
+      /*exp_output_data=*/{{1, 2, 3, 4, 5, 6}}, TestFixture::TENSOR_TYPE);
 }
 
-// int32 tests.
-TEST(UnpackOpTest, IntThreeOutputs) {
-  UnpackOpModel<int32_t> model({TensorType_INT32, {3, 2}}, 0);
-  model.SetInput({1, 2, 3, 4, 5, 6});
-  model.Invoke();
-
-  // Check outputs shapes.
-  const std::vector<std::vector<int>>& output_shapes = model.GetOutputShapes();
-  EXPECT_EQ(output_shapes.size(), 3);
-  EXPECT_THAT(output_shapes[0], ElementsAre(2));
-  EXPECT_THAT(output_shapes[1], ElementsAre(2));
-  EXPECT_THAT(output_shapes[2], ElementsAre(2));
-
-  // Check outputs values.
-  const std::vector<std::vector<int32_t>>& output_datas =
-      model.GetOutputDatas();
-  EXPECT_EQ(output_datas.size(), 3);
-  EXPECT_THAT(output_datas[0], ElementsAre(1, 2));
-  EXPECT_THAT(output_datas[1], ElementsAre(3, 4));
-  EXPECT_THAT(output_datas[2], ElementsAre(5, 6));
+TYPED_TEST(UnpackOpTest, ThreeDimensionsOutputs) {
+  Check<typename TestFixture::TypeToTest>(
+      /*axis=*/2, /*input_shape=*/{2, 2, 2},
+      /*input_data=*/{1, 2, 3, 4, 5, 6, 7, 8},
+      /*exp_output_shape=*/{{2, 2}, {2, 2}},
+      /*exp_output_data=*/{{1, 3, 5, 7}, {2, 4, 6, 8}},
+      TestFixture::TENSOR_TYPE);
 }
 
-TEST(UnpackOpTest, IntThreeOutputsAxisOne) {
-  UnpackOpModel<int32_t> model({TensorType_INT32, {3, 2}}, 1);
-  model.SetInput({1, 2, 3, 4, 5, 6});
-  model.Invoke();
-
-  // Check outputs shapes.
-  const std::vector<std::vector<int>>& output_shapes = model.GetOutputShapes();
-  EXPECT_EQ(output_shapes.size(), 2);
-  EXPECT_THAT(output_shapes[0], ElementsAre(3));
-  EXPECT_THAT(output_shapes[1], ElementsAre(3));
-
-  // Check outputs values.
-  const std::vector<std::vector<int32_t>>& output_datas =
-      model.GetOutputDatas();
-  EXPECT_EQ(output_datas.size(), 2);
-  EXPECT_THAT(output_datas[0], ElementsAre(1, 3, 5));
-  EXPECT_THAT(output_datas[1], ElementsAre(2, 4, 6));
+TYPED_TEST(UnpackOpTest, FiveDimensionsOutputs) {
+  Check<typename TestFixture::TypeToTest>(
+      /*axis=*/2, /*input_shape=*/{2, 2, 2, 2, 1},
+      /*input_data=*/{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+      /*exp_output_shape=*/{{2, 2, 2, 1}, {2, 2, 2, 1}},
+      /*exp_output_data=*/
+      {{1, 2, 5, 6, 9, 10, 13, 14}, {3, 4, 7, 8, 11, 12, 15, 16}},
+      /*type=*/TestFixture::TENSOR_TYPE);
 }
 
-TEST(UnpackOpTest, IntOneOutput) {
-  UnpackOpModel<int32_t> model({TensorType_INT32, {1, 6}}, 0);
-  model.SetInput({1, 2, 3, 4, 5, 6});
-  model.Invoke();
-
-  // Check outputs shapes.
-  const std::vector<std::vector<int>>& output_shapes = model.GetOutputShapes();
-  EXPECT_EQ(output_shapes.size(), 1);
-  EXPECT_THAT(output_shapes[0], ElementsAre(6));
-
-  // Check outputs values.
-  const std::vector<std::vector<int32_t>>& output_datas =
-      model.GetOutputDatas();
-  EXPECT_EQ(output_datas.size(), 1);
-  EXPECT_THAT(output_datas[0], ElementsAre(1, 2, 3, 4, 5, 6));
+TYPED_TEST(UnpackOpTest, VectorToScalar) {
+  Check<typename TestFixture::TypeToTest>(
+      /*axis=*/0, /*input_shape=*/{5},
+      /*input_data=*/{1, 2, 3, 4, 5},
+      /*exp_output_shape=*/{{}, {}, {}, {}, {}},
+      /*exp_output_data=*/{{1}, {2}, {3}, {4}, {5}}, TestFixture::TENSOR_TYPE);
 }
 
-TEST(UnpackOpTest, IntThreeDimensionsOutputs) {
-  UnpackOpModel<int32_t> model({TensorType_INT32, {2, 2, 2}}, 2);
-  model.SetInput({1, 2, 3, 4, 5, 6, 7, 8});
-  model.Invoke();
+#if defined(TFLITE_ENABLE_EXTRA_REFERENCE_KERNELS)
+TEST(UnpackOpTest, Float8) {
+  for (TensorType tensor_type :
+       {TensorType_FLOAT8_E4M3FN, TensorType_FLOAT8_E5M2}) {
+    Check<uint8_t>(/*axis=*/0, /*input_shape=*/{2, 2},
+                   /*input_data=*/{0x00, 0x38, 0xbc, 0x7e},
+                   /*exp_output_shape=*/{{2}, {2}},
+                   /*exp_output_data=*/{{0x00, 0x38}, {0xbc, 0x7e}},
+                   tensor_type);
+  }
+}
+#endif
 
-  // Check outputs shapes.
-  const std::vector<std::vector<int>>& output_shapes = model.GetOutputShapes();
-  EXPECT_EQ(output_shapes.size(), 2);
-  EXPECT_THAT(output_shapes[0], ElementsAre(2, 2));
-  EXPECT_THAT(output_shapes[1], ElementsAre(2, 2));
+// bool tests.
+TEST(UnpackOpTestBool, BoolThreeOutputs) {
+  Check<bool>(
+      /*axis=*/0, /*input_shape=*/{3, 2},
+      /*input_data=*/{true, false, true, false, true, false},
+      /*exp_output_shape=*/{{2}, {2}, {2}},
+      /*exp_output_data=*/{{true, false}, {true, false}, {true, false}},
+      /*type=*/TensorType_BOOL);
+}
 
-  // Check outputs values.
-  const std::vector<std::vector<int32_t>>& output_datas =
-      model.GetOutputDatas();
-  EXPECT_EQ(output_datas.size(), 2);
-  EXPECT_THAT(output_datas[0], ElementsAre(1, 3, 5, 7));
-  EXPECT_THAT(output_datas[1], ElementsAre(2, 4, 6, 8));
+TEST(UnpackOpTestBool, BoolThreeOutputsAxisOne) {
+  Check<bool>(
+      /*axis=*/1, /*input_shape=*/{3, 2},
+      /*input_data=*/{true, false, true, false, true, false},
+      /*exp_output_shape=*/{{3}, {3}},
+      /*exp_output_data=*/{{true, true, true}, {false, false, false}},
+      /*type=*/TensorType_BOOL);
+}
+
+TEST(UnpackOpTestBool, BoolThreeOutputsNegativeAxisOne) {
+  Check<bool>(
+      /*axis=*/-1, /*input_shape=*/{3, 2},
+      /*input_data=*/{true, false, true, false, true, false},
+      /*exp_output_shape=*/{{3}, {3}},
+      /*exp_output_data=*/{{true, true, true}, {false, false, false}},
+      /*type=*/TensorType_BOOL);
+}
+
+TEST(UnpackOpTestBool, BoolThreeOutputsNegativeAxisTwo) {
+  Check<bool>(
+      /*axis=*/-2, /*input_shape=*/{3, 2},
+      /*input_data=*/{true, false, true, false, true, false},
+      /*exp_output_shape=*/{{2}, {2}, {2}},
+      /*exp_output_data=*/{{true, false}, {true, false}, {true, false}},
+      /*type=*/TensorType_BOOL);
+}
+
+TEST(UnpackOpTestBool, BoolOneOutput) {
+  Check<bool>(
+      /*axis=*/0, /*input_shape=*/{1, 6},
+      /*input_data=*/{true, false, true, false, true, false},
+      /*exp_output_shape=*/{{6}},
+      /*exp_output_data=*/{{true, false, true, false, true, false}},
+      /*type=*/TensorType_BOOL);
+}
+
+TEST(UnpackOpTestBool, BoolThreeDimensionsOutputs) {
+  Check<bool>(
+      /*axis=*/2, /*input_shape=*/{2, 2, 2},
+      /*input_data=*/{true, false, true, false, true, false, true, false},
+      /*exp_output_shape=*/{{2, 2}, {2, 2}},
+      /*exp_output_data=*/
+      {{true, true, true, true}, {false, false, false, false}},
+      /*type=*/TensorType_BOOL);
+}
+
+TEST(UnpackOpTest, BoolFiveDimensionsOutputs) {
+  Check<bool>(
+      /*axis=*/2, /*input_shape=*/{2, 2, 2, 2, 1},
+      /*input_data=*/
+      {true, false, true, false, true, false, true, false, true, true, true,
+       true, true, true, true, true},
+      /*exp_output_shape=*/{{2, 2, 2, 1}, {2, 2, 2, 1}},
+      /*exp_output_data=*/
+      {{true, false, true, false, true, true, true, true},
+       {true, false, true, false, true, true, true, true}},
+      /*type=*/TensorType_BOOL);
+}
+
+TEST(UnpackOpTestBool, BoolVectorToScalar) {
+  Check<bool>(/*axis=*/0, /*input_shape=*/{5},
+              /*input_data=*/{true, false, true, false, true},
+              /*exp_output_shape=*/{{}, {}, {}, {}, {}},
+              /*exp_output_data=*/{{true}, {false}, {true}, {false}, {true}},
+              /*type=*/TensorType_BOOL);
 }
 
 }  // namespace
 }  // namespace tflite
-
-int main(int argc, char** argv) {
-  ::tflite::LogToStderr();
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}

@@ -14,10 +14,6 @@
 # ==============================================================================
 """Test utilities for tf.signal."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from tensorflow.core.protobuf import config_pb2
 from tensorflow.python.grappler import tf_optimizer
 from tensorflow.python.training import saver
@@ -31,11 +27,11 @@ def grappler_optimize(graph, fetches=None, config_proto=None):
     fetches: An optional list of `Tensor`s to fetch (i.e. not optimize away).
       Grappler uses the 'train_op' collection to look for fetches, so if not
       provided this collection should be non-empty.
-    config_proto: An optional `tf.ConfigProto` to use when rewriting the
-      graph.
+    config_proto: An optional `tf.compat.v1.ConfigProto` to use when rewriting
+      the graph.
 
   Returns:
-    A `tf.GraphDef` containing the rewritten graph.
+    A `tf.compat.v1.GraphDef` containing the rewritten graph.
   """
   if config_proto is None:
     config_proto = config_pb2.ConfigProto()
@@ -45,3 +41,4 @@ def grappler_optimize(graph, fetches=None, config_proto=None):
       graph.add_to_collection('train_op', fetch)
   metagraph = saver.export_meta_graph(graph_def=graph.as_graph_def())
   return tf_optimizer.OptimizeGraph(config_proto, metagraph)
+

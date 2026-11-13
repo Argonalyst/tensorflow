@@ -14,162 +14,197 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/lib/core/status.h"
+
+#include <utility>
+
+#include "absl/status/status.h"
+#include "absl/strings/cord.h"
+#include "absl/strings/match.h"
+#include "xla/tsl/protobuf/error_codes.pb.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
-#include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/platform/test_benchmark.h"
 
 namespace tensorflow {
 
 TEST(Status, OK) {
-  EXPECT_EQ(Status::OK().code(), error::OK);
-  EXPECT_EQ(Status::OK().error_message(), "");
-  TF_EXPECT_OK(Status::OK());
-  TF_ASSERT_OK(Status::OK());
-  EXPECT_EQ(Status::OK(), Status());
-  Status s;
+  EXPECT_EQ(absl::OkStatus().code(), error::OK);
+  EXPECT_EQ(absl::OkStatus().message(), "");
+  TF_EXPECT_OK(absl::OkStatus());
+  TF_ASSERT_OK(absl::OkStatus());
+  EXPECT_EQ(absl::OkStatus(), absl::Status());
+  absl::Status s;
   EXPECT_TRUE(s.ok());
 }
 
 TEST(DeathStatus, CheckOK) {
-  Status status(errors::InvalidArgument("Invalid"));
+  absl::Status status(absl::InvalidArgumentError("Invalid"));
   ASSERT_DEATH(TF_CHECK_OK(status), "Invalid");
 }
 
 TEST(Status, Set) {
-  Status status;
-  status = Status(error::CANCELLED, "Error message");
-  EXPECT_EQ(status.code(), error::CANCELLED);
-  EXPECT_EQ(status.error_message(), "Error message");
+  absl::Status status;
+  status = absl::Status(absl::StatusCode::kCancelled, "Error message");
+  EXPECT_EQ(status.code(), absl::StatusCode::kCancelled);
+  EXPECT_EQ(status.message(), "Error message");
 }
 
 TEST(Status, Copy) {
-  Status a(errors::InvalidArgument("Invalid"));
-  Status b(a);
+  absl::Status a(absl::InvalidArgumentError("Invalid"));
+  absl::Status b(a);
   ASSERT_EQ(a.ToString(), b.ToString());
 }
 
 TEST(Status, Assign) {
-  Status a(errors::InvalidArgument("Invalid"));
-  Status b;
+  absl::Status a(absl::InvalidArgumentError("Invalid"));
+  absl::Status b;
   b = a;
   ASSERT_EQ(a.ToString(), b.ToString());
 }
 
+TEST(Status, Move) {
+  absl::Status a(absl::InvalidArgumentError("Invalid"));
+  absl::Status b(std::move(a));
+  ASSERT_EQ("INVALID_ARGUMENT: Invalid", b.ToString());
+}
+
+TEST(Status, MoveAssign) {
+  absl::Status a(absl::InvalidArgumentError("Invalid"));
+  absl::Status b;
+  b = std::move(a);
+  ASSERT_EQ("INVALID_ARGUMENT: Invalid", b.ToString());
+}
+
 TEST(Status, Update) {
-  Status s;
-  s.Update(Status::OK());
+  absl::Status s;
+  s.Update(absl::OkStatus());
   ASSERT_TRUE(s.ok());
-  Status a(errors::InvalidArgument("Invalid"));
+  absl::Status a(absl::InvalidArgumentError("Invalid"));
   s.Update(a);
   ASSERT_EQ(s.ToString(), a.ToString());
-  Status b(errors::Internal("Internal"));
+  absl::Status b(absl::InternalError("Internal"));
   s.Update(b);
   ASSERT_EQ(s.ToString(), a.ToString());
-  s.Update(Status::OK());
+  s.Update(absl::OkStatus());
   ASSERT_EQ(s.ToString(), a.ToString());
   ASSERT_FALSE(s.ok());
 }
 
-TEST(Status, EqualsOK) { ASSERT_EQ(Status::OK(), Status()); }
+TEST(Status, EqualsOK) { ASSERT_EQ(absl::OkStatus(), absl::Status()); }
 
 TEST(Status, EqualsSame) {
-  Status a(errors::InvalidArgument("Invalid"));
-  Status b(errors::InvalidArgument("Invalid"));
+  absl::Status a(absl::InvalidArgumentError("Invalid"));
+  absl::Status b(absl::InvalidArgumentError("Invalid"));
   ASSERT_EQ(a, b);
 }
 
 TEST(Status, EqualsCopy) {
-  const Status a(errors::InvalidArgument("Invalid"));
-  const Status b = a;
+  const absl::Status a(absl::InvalidArgumentError("Invalid"));
+  const absl::Status b = a;
   ASSERT_EQ(a, b);
 }
 
 TEST(Status, EqualsDifferentCode) {
-  const Status a(errors::InvalidArgument("message"));
-  const Status b(errors::Internal("message"));
+  const absl::Status a(absl::InvalidArgumentError("message"));
+  const absl::Status b(absl::InternalError("message"));
   ASSERT_NE(a, b);
 }
 
 TEST(Status, EqualsDifferentMessage) {
-  const Status a(errors::InvalidArgument("message"));
-  const Status b(errors::InvalidArgument("another"));
+  const absl::Status a(absl::InvalidArgumentError("message"));
+  const absl::Status b(absl::InvalidArgumentError("another"));
   ASSERT_NE(a, b);
 }
 
-TEST(StatusGroup, AcceptsFirstCode) {
+TEST(StatusGroup, OKStatusGroup) {
   StatusGroup c;
-  const Status internal(errors::Internal("Original error."));
-  c.Update(internal);
-  c.Update(Status::OK());
-  c.Update(Status::OK());
-  c.Update(Status::OK());
-  ASSERT_EQ(c.as_status().code(), internal.code());
-  ASSERT_EQ(c.ok(), false);
+  c.Update(absl::OkStatus());
+  c.Update(absl::OkStatus());
+  ASSERT_EQ(c.as_summary_status(), absl::OkStatus());
+  ASSERT_EQ(c.as_concatenated_status(), absl::OkStatus());
 }
 
-TEST(StatusGroup, ContainsChildMessages) {
+TEST(StatusGroup, AggregateWithSingleErrorStatus) {
   StatusGroup c;
-  const Status internal(errors::Internal("Original error."));
-  const Status cancelled(errors::Cancelled("Cancelled after 10 steps."));
-  const Status aborted(errors::Aborted("Aborted after 10 steps."));
+  const absl::Status internal(absl::InternalError("Original error."));
+
   c.Update(internal);
-  for (size_t i = 0; i < 5; ++i) {
-    c.Update(cancelled);
-  }
-  for (size_t i = 0; i < 10; ++i) {
-    c.Update(aborted);
-  }
-  for (size_t i = 0; i < 100; ++i) {
-    c.Update(Status::OK());
-  }
+  ASSERT_EQ(c.as_summary_status(), internal);
 
-  ASSERT_EQ(c.as_status().code(), internal.code());
-  EXPECT_TRUE(str_util::StrContains(c.as_status().error_message(),
-                                    internal.error_message()));
-  EXPECT_TRUE(str_util::StrContains(c.as_status().error_message(),
-                                    cancelled.error_message()));
-  EXPECT_TRUE(str_util::StrContains(c.as_status().error_message(),
-                                    aborted.error_message()));
-  StatusGroup d;
-  d.Update(c.as_status());
-  c.Update(errors::FailedPrecondition("Failed!"));
-  d.Update(c.as_status());
-  c.Update(errors::DataLoss("Data loss!"));
-  d.Update(c.as_status());
-  LOG(INFO) << d.as_status();
+  absl::Status concat_status = c.as_concatenated_status();
+  ASSERT_EQ(concat_status.code(), internal.code());
+  ASSERT_TRUE(absl::StrContains(concat_status.message(), internal.message()));
+
+  // Add derived error status
+  const absl::Status derived =
+      StatusGroup::MakeDerived(absl::InternalError("Derived error."));
+  c.Update(derived);
+
+  ASSERT_EQ(c.as_summary_status(), internal);
+
+  concat_status = c.as_concatenated_status();
+  ASSERT_EQ(concat_status.code(), internal.code());
+  ASSERT_TRUE(absl::StrContains(concat_status.message(), internal.message()));
 }
 
-TEST(StatusGroup, ContainsIdenticalMessage) {
-  StatusGroup sg;
-  const Status internal(errors::Internal("Original error"));
-  for (size_t i = 0; i < 10; i++) {
-    sg.Update(internal);
-  }
-  EXPECT_EQ(sg.as_status(), internal);
+TEST(StatusGroup, AggregateWithMultipleErrorStatus) {
+  StatusGroup c;
+  const absl::Status internal(absl::InternalError("Original error."));
+  const absl::Status cancelled(
+      absl::CancelledError("Cancelled after 10 steps."));
+  const absl::Status aborted(absl::AbortedError("Aborted after 10 steps."));
+
+  c.Update(internal);
+  c.Update(cancelled);
+  c.Update(aborted);
+
+  absl::Status summary = c.as_summary_status();
+
+  ASSERT_EQ(summary.code(), internal.code());
+  ASSERT_TRUE(absl::StrContains(summary.message(), internal.message()));
+  ASSERT_TRUE(absl::StrContains(summary.message(), cancelled.message()));
+  ASSERT_TRUE(absl::StrContains(summary.message(), aborted.message()));
+
+  absl::Status concat_status = c.as_concatenated_status();
+  ASSERT_EQ(concat_status.code(), internal.code());
+  ASSERT_TRUE(absl::StrContains(concat_status.message(), internal.message()));
+  ASSERT_TRUE(absl::StrContains(concat_status.message(), cancelled.message()));
+  ASSERT_TRUE(absl::StrContains(concat_status.message(), aborted.message()));
 }
 
-TEST(StatusGroup, ContainsCommonPrefix) {
-  StatusGroup sg;
-  const Status a(errors::Internal("Original error"));
-  const Status b(errors::Internal("Original error is"));
-  const Status c(errors::Internal("Original error is invalid"));
-  sg.Update(a);
-  sg.Update(c);
-  sg.Update(c);
-  sg.Update(b);
-  sg.Update(c);
-  sg.Update(b);
-  sg.Update(a);
-  sg.Update(b);
-  EXPECT_EQ(sg.as_status(), c);
+TEST(Status, InvalidPayloadGetsIgnored) {
+  absl::Status s = absl::Status();
+  s.SetPayload("Invalid", absl::Cord("Invalid Val"));
+  ASSERT_FALSE(s.GetPayload("Invalid").has_value());
+  bool is_err_erased = s.ErasePayload("Invalid");
+  ASSERT_EQ(is_err_erased, false);
 }
 
-static void BM_TF_CHECK_OK(int iters) {
-  tensorflow::Status s =
-      (iters < 0) ? errors::InvalidArgument("Invalid") : Status::OK();
-  for (int i = 0; i < iters; i++) {
+TEST(Status, SetPayloadSetsOrUpdatesIt) {
+  absl::Status s(absl::StatusCode::kInternal, "Error message");
+  s.SetPayload("Error key", absl::Cord("Original"));
+  ASSERT_EQ(s.GetPayload("Error key"), absl::Cord("Original"));
+  s.SetPayload("Error key", absl::Cord("Updated"));
+  ASSERT_EQ(s.GetPayload("Error key"), absl::Cord("Updated"));
+}
+
+TEST(Status, ErasePayloadRemovesIt) {
+  absl::Status s(absl::StatusCode::kInternal, "Error message");
+  s.SetPayload("Error key", absl::Cord("Original"));
+
+  bool is_err_erased = s.ErasePayload("Error key");
+  ASSERT_EQ(is_err_erased, true);
+  is_err_erased = s.ErasePayload("Error key");
+  ASSERT_EQ(is_err_erased, false);
+  ASSERT_FALSE(s.GetPayload("Error key").has_value());
+}
+
+static void BM_TF_CHECK_OK(::testing::benchmark::State& state) {
+  absl::Status s = (state.max_iterations < 0)
+                       ? absl::InvalidArgumentError("Invalid")
+                       : absl::OkStatus();
+  for (auto i : state) {
     TF_CHECK_OK(s);
   }
 }

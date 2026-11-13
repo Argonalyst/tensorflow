@@ -21,18 +21,12 @@ images, etc.
 This module contains methods that allow plugin assets to be specified at graph
 construction time. Plugin authors define a PluginAsset which is treated as a
 singleton on a per-graph basis. The PluginAsset has an assets method which
-returns a dictionary of asset contents. The tf.summary.FileWriter
+returns a dictionary of asset contents. The tf.compat.v1.summary.FileWriter
 (or any other Summary writer) will serialize these assets in such a way that
 TensorBoard can retrieve them.
 """
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import abc
-
-import six
 
 from tensorflow.python.framework import ops
 
@@ -109,8 +103,7 @@ def get_all_plugin_assets(graph=None):
   return out
 
 
-@six.add_metaclass(abc.ABCMeta)
-class PluginAsset(object):
+class PluginAsset(metaclass=abc.ABCMeta):
   """This abstract base class allows TensorBoard to serialize assets to disk.
 
   Plugin authors are expected to extend the PluginAsset class, so that it:
@@ -123,9 +116,9 @@ class PluginAsset(object):
   - It is constructed when get_plugin_asset is called on the class for
     the first time.
   - It is configured by code that follows the calls to get_plugin_asset
-  - When the containing graph is serialized by the tf.summary.FileWriter, the
-    writer calls assets and the PluginAsset instance provides its contents to be
-    written to disk.
+  - When the containing graph is serialized by the
+    tf.compat.v1.summary.FileWriter, the writer calls assets and the
+    PluginAsset instance provides its contents to be written to disk.
   """
 
   plugin_name = None
@@ -137,7 +130,7 @@ class PluginAsset(object):
     The assets method should return a dictionary structured as
     {asset_name: asset_contents}. asset_contents is a string.
 
-    This method will be called by the tf.summary.FileWriter when it is time to
-    write the assets out to disk.
+    This method will be called by the tf.compat.v1.summary.FileWriter when it
+    is time to write the assets out to disk.
     """
     raise NotImplementedError()

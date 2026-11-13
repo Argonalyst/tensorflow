@@ -1,4 +1,17 @@
-# -*- Python -*-
+# Copyright 2026 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 load(
     "//tensorflow:tensorflow.bzl",
@@ -49,16 +62,19 @@ def tf_java_op_gen_srcjar(
 
     # Generate a source archive containing generated code for these ops.
     gen_srcjar = out_dir + name + ".srcjar"
-    gen_cmds += ["$(location @local_jdk//:jar) cMf $(location :" + gen_srcjar + ") -C $(@D) src"]
+    gen_cmds += ["$(JAVABASE)/bin/jar cMf $(location :" + gen_srcjar + ") -C $(@D) src"]
 
     native.genrule(
         name = name,
         srcs = srcs,
         outs = [gen_srcjar],
         tools = [
-            "@local_jdk//:jar",
-            "@local_jdk//:jdk",
+            # copybara:uncomment_begin(using system-provided in OSS build)
+            # "//third_party/java/jar:jar",
+            # "//third_party/java/jdk:jdk",
+            # copybara:uncomment_end
             gen_tool,
         ] + tf_binary_additional_srcs(),
+        toolchains = ["@bazel_tools//tools/jdk:current_host_java_runtime"],
         cmd = " && ".join(gen_cmds),
     )

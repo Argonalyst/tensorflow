@@ -13,25 +13,44 @@
 # limitations under the License.
 # ==============================================================================
 """TFDecorator-aware replacements for the inspect module."""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-from collections import namedtuple
+import collections
 import functools
 import inspect as _inspect
 
-import six
-
 from tensorflow.python.util import tf_decorator
 
-ArgSpec = _inspect.ArgSpec
+
+# inspect.signature() is preferred over inspect.getfullargspec() in PY3.
+# Note that while it can handle TFDecorators, it will ignore a TFDecorator's
+# provided ArgSpec/FullArgSpec and instead return the signature of the
+# inner-most function.
+def signature(obj, *, follow_wrapped=True):
+  """TFDecorator-aware replacement for inspect.signature."""
+  return _inspect.signature(
+      tf_decorator.unwrap(obj)[1], follow_wrapped=follow_wrapped)
+
+
+Parameter = _inspect.Parameter
+Signature = _inspect.Signature
+
+if hasattr(_inspect, 'ArgSpec'):
+  ArgSpec = _inspect.ArgSpec
+else:
+  ArgSpec = collections.namedtuple(
+      'ArgSpec',
+      [
+          'args',
+          'varargs',
+          'keywords',
+          'defaults',
+      ],
+  )
 
 
 if hasattr(_inspect, 'FullArgSpec'):
   FullArgSpec = _inspect.FullArgSpec  # pylint: disable=invalid-name
 else:
-  FullArgSpec = namedtuple('FullArgSpec', [
+  FullArgSpec = collections.namedtuple('FullArgSpec', [
       'args', 'varargs', 'varkw', 'defaults', 'kwonlyargs', 'kwonlydefaults',
       'annotations'
   ])
@@ -69,11 +88,20 @@ if hasattr(_inspect, 'getfullargspec'):
       from FullArgSpec.
     """
     fullargspecs = getfullargspec(target)
+
+    defaults = fullargspecs.defaults or ()
+    if fullargspecs.kwonlydefaults:
+      defaults += tuple(fullargspecs.kwonlydefaults.values())
+
+    if not defaults:
+      defaults = None
+
     argspecs = ArgSpec(
-        args=fullargspecs.args,
+        args=fullargspecs.args + fullargspecs.kwonlyargs,
         varargs=fullargspecs.varargs,
         keywords=fullargspecs.varkw,
-        defaults=fullargspecs.defaults)
+        defaults=defaults,
+    )
     return argspecs
 else:
   _getargspec = _inspect.getargspec
@@ -143,7 +171,7 @@ def getargspec(obj):
       pass
 
   # The `type(target)` ensures that if a class is received we don't return
-  # the signature of it's __call__ method.
+  # the signature of its __call__ method.
   return _getargspec(type(target).__call__)
 
 
@@ -151,7 +179,7 @@ def _get_argspec_for_partial(obj):
   """Implements `getargspec` for `functools.partial` objects.
 
   Args:
-    obj: The `functools.partial` obeject
+    obj: The `functools.partial` object
   Returns:
     An `inspect.ArgSpec`
   Raises:
@@ -205,9 +233,13 @@ def _get_argspec_for_partial(obj):
     all_defaults[-len(defaults):] = defaults
 
   # Fill in default values provided by partial function in all_defaults.
-  for kw, default in six.iteritems(partial_keywords):
-    idx = args.index(kw)
-    all_defaults[idx] = default
+  for kw, default in iter(partial_keywords.items()):
+    if kw in args:
+      idx = args.index(kw)
+      all_defaults[idx] = default
+    elif not keywords:
+      raise ValueError(f'{obj} does not have a **kwargs parameter, but '
+                       f'contains an unknown partial keyword {kw}.')
 
   # Find first argument with default value set.
   first_default = next(
@@ -224,9 +256,8 @@ def _get_argspec_for_partial(obj):
   ]
 
   if invalid_default_values:
-    raise ValueError('Some arguments %s do not have default value, but they '
-                     'are positioned after those with default values. This can '
-                     'not be expressed with ArgSpec.' % invalid_default_values)
+    raise ValueError(f'{obj} has some keyword-only arguments, which are not'
+                     f' supported: {invalid_default_values}.')
 
   return ArgSpec(args, varargs, keywords, tuple(all_defaults[first_default:]))
 
@@ -253,12 +284,12 @@ def getfullargspec(obj):
   return _getfullargspec(target)
 
 
-def getcallargs(func, *positional, **named):
+def getcallargs(*func_and_positional, **named):
   """TFDecorator-aware replacement for inspect.getcallargs.
 
   Args:
-    func: A callable, possibly decorated
-    *positional: The positional arguments that would be passed to `func`.
+    *func_and_positional: A callable, possibly decorated, followed by any
+      positional arguments that would be passed to `func`.
     **named: The named argument dictionary that would be passed to `func`.
 
   Returns:
@@ -269,6 +300,8 @@ def getcallargs(func, *positional, **named):
   it. If no attached decorators modify argspec, the final unwrapped target's
   argspec will be used.
   """
+  func = func_and_positional[0]
+  positional = func_and_positional[1:]
   argspec = getfullargspec(func)
   call_args = named.copy()
   this = getattr(func, 'im_self', None) or getattr(func, '__self__', None)
@@ -281,6 +314,10 @@ def getcallargs(func, *positional, **named):
     for arg, value in zip(argspec.args[-default_count:], argspec.defaults):
       if arg not in call_args:
         call_args[arg] = value
+  if argspec.kwonlydefaults is not None:
+    for k, v in argspec.kwonlydefaults.items():
+      if k not in call_args:
+        call_args[k] = v
   return call_args
 
 
@@ -372,9 +409,50 @@ def isgenerator(object):  # pylint: disable=redefined-builtin
   return _inspect.isgenerator(tf_decorator.unwrap(object)[1])
 
 
+def isgeneratorfunction(object):  # pylint: disable=redefined-builtin
+  """TFDecorator-aware replacement for inspect.isgeneratorfunction."""
+  return _inspect.isgeneratorfunction(tf_decorator.unwrap(object)[1])
+
+
 def ismethod(object):  # pylint: disable=redefined-builtin
   """TFDecorator-aware replacement for inspect.ismethod."""
   return _inspect.ismethod(tf_decorator.unwrap(object)[1])
+
+
+def isanytargetmethod(object):  # pylint: disable=redefined-builtin
+  # pylint: disable=g-doc-args,g-doc-return-or-yield
+  """Checks if `object` or a TF Decorator wrapped target contains self or cls.
+
+  This function could be used along with `tf_inspect.getfullargspec` to
+  determine if the first argument of `object` argspec is self or cls. If the
+  first argument is self or cls, it needs to be excluded from argspec when we
+  compare the argspec to the input arguments and, if provided, the tf.function
+  input_signature.
+
+  Like `tf_inspect.getfullargspec` and python `inspect.getfullargspec`, it
+  does not unwrap python decorators.
+
+  Args:
+    obj: An method, function, or functool.partial, possibly decorated by
+    TFDecorator.
+
+  Returns:
+    A bool indicates if `object` or any target along the chain of TF decorators
+    is a method.
+  """
+  decorators, target = tf_decorator.unwrap(object)
+  for decorator in decorators:
+    if _inspect.ismethod(decorator.decorated_target):
+      return True
+
+  # TODO(b/194845243): Implement the long term solution with inspect.signature.
+  # A functools.partial object is not a function or method. But if the wrapped
+  # func is a method, the argspec will contain self/cls.
+  while isinstance(target, functools.partial):
+    target = target.func
+
+  # `target` is a method or an instance with __call__
+  return callable(target) and not _inspect.isfunction(target)
 
 
 def ismodule(object):  # pylint: disable=redefined-builtin
@@ -390,22 +468,3 @@ def isroutine(object):  # pylint: disable=redefined-builtin
 def stack(context=1):
   """TFDecorator-aware replacement for inspect.stack."""
   return _inspect.stack(context)[1:]
-
-
-def getsource_no_unwrap(obj):
-  """Return source code for an object. Does not unwrap TFDecorators.
-
-  The source code is returned literally, including indentation for functions not
-  at the top level. This function is analogous to inspect.getsource, with one
-  key difference - it doesn't unwrap decorators. For simplicity, support for
-  some Python object types is dropped (tracebacks, frames, code objects).
-
-  Args:
-      obj: a class, method, or function object.
-
-  Returns:
-      source code as a string
-
-  """
-  lines, lnum = _inspect.findsource(obj)
-  return ''.join(_inspect.getblock(lines[lnum:]))
